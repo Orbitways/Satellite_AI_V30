@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>OW Globe — Diagnostic</title>
+<style>
+  body { background:#0a0a14; color:#ccd; font-family:monospace; padding:20px; }
+  h2 { color:#6FE99E; margin-top:2rem; }
+  .test { border:1px solid #223; border-radius:6px; padding:12px; margin:8px 0; }
+  .ok   { border-color:#6FE99E; color:#6FE99E; }
+  .err  { border-color:#EC6E48; color:#EC6E48; }
+  .wait { border-color:#F3B63F; color:#F3B63F; }
+  img   { max-width:256px; max-height:128px; border:1px solid #334; display:block; margin-top:8px; }
+  canvas { border:1px solid #334; display:block; margin-top:8px; }
+  pre   { font-size:.7rem; color:#889; white-space:pre-wrap; word-break:break-all; }
+  button { background:#185BFD; color:#fff; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; margin:4px; }
+</style>
+</head>
+<body>
+<h1 style="color:#fff">🔍 OW Globe — Diagnostic textures</h1>
+<p style="color:#667">Ce fichier teste chaque composant indépendamment. Ouvrez-le depuis le serveur : <code>http://127.0.0.1:5001/diagnostic</code></p>
+<p style="color:#667">Ou double-clic si vous voulez tester RainViewer sans serveur.</p>
+
+<button onclick="runAll()">▶ Lancer tous les tests</button>
+<button onclick="location.reload()">↺ Relancer</button>
+
+<div id="results"></div>
+
+<script>
+const R = document.getElementById('results');
+
+function log(id, status, msg, extra=''){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.className = 'test ' + status;
+  el.innerHTML = `<b>${msg}</b>${extra ? '<pre>'+extra+'</pre>' : ''}`;
+}
+
+function addTest(id, label){
+  const div = document.createElement('div');
+  div.id = id;
+  div.className = 'test wait';
+  div.innerHTML = `<b>⏳ ${label}</b>`;
+  R.appendChild(div);
+  return div;
+}
+
+async function testServerRoute(id, label, url){
+  addTest(id, label + ' → ' + url);
+  try {
+    const t0 = Date.now();
+    const resp = await fetch(url);
+    const ms = Date.now()-t0;
+    if(resp.ok){
+      const blob = await resp.blob();
+      const size = (blob.size/1024).toFixed(0);
+      const imgUrl = URL.createObjectURL(blob);
+      log(id,'ok',`✓ ${label} — HTTP ${resp.status} — ${size} KB — ${ms}ms`,
+        `<img src="${imgUrl}" onerror="this.style.display='none'">`);
+    } else {
+      const text = await resp.text().catch(()=>'');
+      log(id,'err',`✗ ${label} — HTTP ${resp.status} — ${ms}ms`, text.slice(0,200));
+    }
+  } catch(e){
+    log(id,'err',`✗ ${label} — ${e.message}`);
+  }
+}
+
+async function testRainViewerDirect(){
+  addTest('rv_api', 'RainViewer API JSON (navigateur direct)');
+  try {
+    const resp = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+    const data = await resp.json();
+    
+    // Inspecter la structure complète
+    const structure = JSON.stringify(data, (k,v) => 
+      Array.isArray(v) ? `[${v.length} items]` : v, 2
+    ).slice(0,800);
+    
+    // Chercher les données satellite dans toutes les structures possibles
+    const host = data.host || data.Host || 'https://tilecache.rainviewer.com';
+    
+    // Différentes structures possibles de l'API RainViewer
+    let path = null;
+    const tries = [
+      data?.satellite?.infrared?.past,
+      data?.satellite?.infrared,
+      data?.satellite?.past,
+      data?.radar?.past,
+      data?.past,
+    ];
+    for(const arr of tries){
+      if(Array.isArray(arr) && arr.length){
+        path = arr[arr.length-1].path || arr[arr.length-1].time;
+        if(path) break;
+      }
+    }
+    
+    if(path){
+      window._rvHost = host;
+      window._rvPath = path;
+      log('rv_api','ok',`✓ RainViewer API OK — path: ${path}`, 
+        `Structure:\n${structure}`);
+      return {host, path};
+    } else {
+      // Pas de satellite infrared — essayer radar comme fallback visuel
+      log('rv_api','err',`✗ Pas de données satellite infrared\nStructure API:\n${structure}`);
+      return null;
+    }
+  } catch(e){
+    log('rv_api','err',`✗ RainViewer API — ${e.message}`);
+    return null;
+  }
+}
+
+async function testRainViewerTile(host, path){
+  addTest('rv_tile', 'RainViewer tile directe (navigateur)');
+  if(!host || !path){ log('rv_tile','err','✗ Pas de host/path disponible'); return; }
+  const url = `${host}${path}/2/0/0/1/1_1.png`;
+  addTest('rv_tile', 'RainViewer tile → ' + url.slice(0,60)+'...');
+  try {
+    const resp = await fetch(url);
+    if(resp.ok){
+      const blob = await resp.blob();
+      const imgUrl = URL.createObjectURL(blob);
+      log('rv_tile','ok',`✓ Tile RainViewer OK — ${(blob.size/1024).toFixed(1)} KB`,
+        `<img src="${imgUrl}" style="image-rendering:pixelated">`);
+    } else {
+      log('rv_tile','err',`✗ Tile RainViewer — HTTP ${resp.status}`);
+    }
+  } catch(e){
+    log('rv_tile','err',`✗ Tile RainViewer — ${e.message}`);
+  }
+}
+
+async function testRainViewerProxy(path){
+  addTest('rv_proxy','RainViewer via proxy Flask /api/clouds_tile/2/0/0');
+  if(!path){ log('rv_proxy','err','✗ Pas de path RainViewer'); return; }
+  // Envoyer config au serveur d'abord
+  try {
+    await fetch('/api/clouds_config',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({host:window._rvHost,path})
+    });
+  } catch(e){ /* serveur peut-être absent */ }
+  await testServerRoute('rv_proxy','Tile via proxy','/api/clouds_tile/2/0/0');
+}
+
+async function testGlobeTextures(){
+  // Three.js globe avec toutes les layers
+  addTest('globe_render','Globe Three.js — rendu complet');
+  
+  const script = document.createElement('script');
+  script.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+  script.onload = async () => {
+    const canvas = document.createElement('canvas');
+    canvas.width=400; canvas.height=200;
+    document.getElementById('globe_render').innerHTML = '<b>⏳ Globe Three.js — rendu</b>';
+    document.getElementById('globe_render').appendChild(canvas);
+    
+    try {
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x050510);
+      const cam = new THREE.PerspectiveCamera(40,2,0.01,100);
+      cam.position.set(0,0,2.8);
+      const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+      renderer.setSize(400,200,false);
+      scene.add(new THREE.AmbientLight(0xffffff,1));
+      
+      // Sphère de test — couleur unie visible immédiatement
+      const mat = new THREE.MeshBasicMaterial({color:0x1a3a8a});
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(1,32,32),mat);
+      scene.add(mesh);
+      renderer.render(scene,cam);
+      
+      // Charger texture jour
+      const loader = new THREE.TextureLoader();
+      const dayUrl = window.location.hostname === '127.0.0.1' ? '/api/earth_texture' 
+                   : null;
+      
+      if(dayUrl){
+        loader.load(dayUrl, t=>{
+          mat.map=t; mat.color.set(0xffffff); mat.needsUpdate=true;
+          renderer.render(scene,cam);
+          document.getElementById('globe_render').innerHTML = 
+            '<b style="color:#6FE99E">✓ Globe + Blue Marble rendu</b>';
+          document.getElementById('globe_render').appendChild(canvas);
+        }, undefined, e=>{
+          document.getElementById('globe_render').innerHTML = 
+            `<b style="color:#EC6E48">✗ Blue Marble échoué: ${e}</b>`;
+          document.getElementById('globe_render').appendChild(canvas);
+        });
+      } else {
+        renderer.render(scene,cam);
+        document.getElementById('globe_render').innerHTML = 
+          '<b style="color:#F3B63F">⚠ Globe rendu (placeholder) — ouvrir depuis le serveur pour tester les textures NASA</b>';
+        document.getElementById('globe_render').appendChild(canvas);
+      }
+    } catch(e){
+      log('globe_render','err',`✗ Three.js: ${e.message}`);
+    }
+  };
+  document.head.appendChild(script);
+}
+
+async function testTerminator(){
+  addTest('terminator','Terminator jour/nuit — calcul astronomique');
+  
+  // Calcul astronomique
+  const jd = Date.now()/86400000+2440587.5;
+  const d  = jd-2451545.0;
+  const g  = (357.528+0.9856003*d)%360*Math.PI/180;
+  const lam= ((280.460+0.9856474*d)%360+1.915*Math.sin(g)+0.020*Math.sin(2*g))*Math.PI/180;
+  const eps= 23.439*Math.PI/180;
+  const decl = Math.asin(Math.sin(eps)*Math.sin(lam))*180/Math.PI;
+  const ra   = Math.atan2(Math.cos(eps)*Math.sin(lam),Math.cos(lam))*180/Math.PI;
+  const gmst = (280.46061837+360.98564736629*d)%360;
+  const subLon = ((ra-gmst)%360+360)%360-180;
+  
+  // Canvas visuel du terminator
+  const c = document.createElement('canvas'); c.width=360; c.height=180;
+  const ctx = c.getContext('2d');
+  const id = ctx.createImageData(360,180);
+  const declR = decl*Math.PI/180;
+  const subLonR = subLon*Math.PI/180;
+  
+  for(let py=0;py<180;py++){
+    const lat=(0.5-py/180)*Math.PI;
+    for(let px=0;px<360;px++){
+      const lon=(px/360-0.5)*Math.PI*2;
+      const sinAlt=Math.sin(declR)*Math.sin(lat)+Math.cos(declR)*Math.cos(lat)*Math.cos(lon-subLonR);
+      const i4=(py*360+px)*4;
+      if(sinAlt>0.1){ id.data[i4]=40;id.data[i4+1]=80;id.data[i4+2]=160;id.data[i4+3]=255; }
+      else if(sinAlt<-0.1){ id.data[i4]=5;id.data[i4+1]=8;id.data[i4+2]=20;id.data[i4+3]=255; }
+      else {
+        const t=(sinAlt+0.1)/0.2;
+        id.data[i4]=Math.round(5+35*t);id.data[i4+1]=Math.round(8+72*t);
+        id.data[i4+2]=Math.round(20+140*t);id.data[i4+3]=255;
+      }
+    }
+  }
+  ctx.putImageData(id,0,0);
+  
+  const el = document.getElementById('terminator');
+  el.className='test ok';
+  el.innerHTML=`<b>✓ Terminator calculé</b><pre>Déclinaison solaire: ${decl.toFixed(2)}°\nLongitude sub-solaire: ${subLon.toFixed(2)}°\nHeure UTC: ${new Date().toUTCString()}</pre>`;
+  el.appendChild(c);
+}
+
+async function runAll(){
+  R.innerHTML = '<h2>Tests en cours…</h2>';
+  
+  // Groupe 1 : serveur Flask
+  R.innerHTML += '<h2>1. Routes serveur Flask</h2>';
+  await testServerRoute('day_tex','Blue Marble (sans nuages)','/api/earth_texture');
+  await testServerRoute('night_tex','Black Marble (nuit)','/api/earth_night');
+  
+  // Groupe 2 : RainViewer
+  R.innerHTML += '<h2>2. Nuages RainViewer</h2>';
+  const rv = await testRainViewerDirect();
+  if(rv){
+    await testRainViewerTile(rv.host, rv.path);
+    await testRainViewerProxy(rv.path);
+  }
+  
+  // Groupe 3 : astronomie + rendu
+  R.innerHTML += '<h2>3. Calculs & rendu</h2>';
+  await testTerminator();
+  await testGlobeTextures();
+  
+  R.insertAdjacentHTML('afterbegin','<p style="color:#6FE99E">✓ Diagnostic terminé</p>');
+}
+
+// Auto-run
+runAll();
+</script>
+</body>
+</html>

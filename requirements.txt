@@ -1,0 +1,14 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+numpy>=1.20,<2.0
+torch>=2.0
+sgp4>=2.22
+scikit-learn>=1.3
+
+# ── Backend web (mode serve) ──────────────────────────────────────────────────
+flask>=3.0
+flask-cors>=4.0
+
+# ── Export embarqué (optionnel) ───────────────────────────────────────────────
+# onnx>=1.14
+# onnxruntime>=1.16        # CPU — RPi 4, PC
+# onnxruntime-gpu>=1.16    # GPU — Jetson AGX Orin
