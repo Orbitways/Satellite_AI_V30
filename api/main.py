@@ -9,15 +9,19 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Make src/ importable
+# Make src/ and scripts/ importable
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
+SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
 
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
 from conjunction import run_conjunction_analysis  # noqa: E402
-from tle_fetcher import fetch_and_store, load_catalog_status
+from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progress
 
 app = FastAPI(
     title="Orbitways Insurer API",
@@ -151,6 +155,10 @@ def refresh_tle(
 def tle_status():
     return load_catalog_status()
 
+@app.get("/v1/tle/refresh/progress")
+def tle_refresh_progress():
+    return load_refresh_progress()
+
 from fastapi import APIRouter
 import json
 from pathlib import Path
@@ -166,3 +174,4 @@ def refresh_progress():
         return json.loads(p.read_text())
     except Exception as e:
         return {"state": "unknown", "error": str(e)}
+    

@@ -5,6 +5,42 @@ En production : utiliser Space-Track.org (compte requis) pour des TLE
 haute précision. Celestrak est suffisant pour du LEO standard.
 """
 
+import json
+import time
+from pathlib import Path
+
+PROGRESS_PATH = Path("data/refresh_progress.json")
+
+
+def _write_refresh_progress(**kwargs):
+    PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "updated_at": time.time(),
+        "updated_at_iso": datetime.now(timezone.utc).isoformat(),
+        **kwargs,
+    }
+
+    tmp = PROGRESS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(PROGRESS_PATH)
+
+
+def load_refresh_progress():
+    if not PROGRESS_PATH.exists():
+        return {
+            "state": "idle",
+            "message": "No TLE refresh currently running.",
+        }
+
+    try:
+        return json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {
+            "state": "unknown",
+            "error": str(e),
+        }
+
 import os
 import re
 import logging
@@ -244,10 +280,30 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
 
     Path("data").mkdir(exist_ok=True)
 
+    started_at = time.time()
+
+    _write_refresh_progress(
+        state="starting",
+        group=group,
+        days=days,
+        pct=0,
+        message="Starting TLE refresh.",
+        started_at=started_at,
+    )
+
     logs = []
 
     def emit(msg, pct=None):
         logs.append(str(msg))
+        _write_refresh_progress(
+            state="running",
+            group=group,
+            days=days,
+            pct=pct,
+            message=str(msg),
+            logs_tail=logs[-10:],
+            started_at=started_at,
+        )
 
     def parse_tle_text(raw: str):
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -317,9 +373,34 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
                 raw_h = client._request(url_hist).decode("utf-8", errors="ignore")
                 batch_tles = parse_tle_text(raw_h) if raw_h and len(raw_h) > 100 else []
                 all_tles.extend(batch_tles)
+
+                _write_refresh_progress(
+                    state="fetching_history",
+                    group=group,
+                    days=days,
+                    pct=pct,
+                    message=f"Batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE",
+                    batches_done=b_idx + 1,
+                    batches_total=len(batches),
+                    fetched_tles=len(all_tles),
+                    started_at=started_at,
+                )
+
                 emit(f"[INFO] Batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE", pct)
             except Exception as be:
                 emit(f"[WARN] Batch {b_idx + 1} failed: {be}", pct)
+            except Exception as e:
+                _write_refresh_progress(
+                    state="error",
+                    group=group,
+                    days=days,
+                    pct=0,
+                    message="TLE refresh failed.",
+                    error=str(e),
+                    started_at=started_at,
+                    finished_at=time.time(),
+                )
+                raise
 
     # Deduplicate by NORAD + epoch
     seen = set()
@@ -341,6 +422,20 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
         emit=emit,
     )
 
+    _write_refresh_progress(
+        state="done",
+        group=group,
+        days=days,
+        pct=100,
+        message="TLE refresh completed.",
+        ingested=len(all_tles),
+        expected=len(all_tles),
+        report=report,
+        stats=stats,
+        started_at=started_at,
+        finished_at=time.time(),
+    )
+
     stats = get_stats()
 
     status = {
@@ -358,6 +453,17 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
     Path("data/tle_status.json").write_text(
         json.dumps(status, indent=2),
         encoding="utf-8",
+    )
+
+    _write_refresh_progress(
+        state="fetching",
+        group=group,
+        days=days,
+        pct=15,
+        message=f"{len(norad_ids)} LEO objects identified.",
+        n_objects=len(norad_ids),
+        fetched_tles=len(all_tles),
+        started_at=started_at,
     )
 
     return status
