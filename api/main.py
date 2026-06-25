@@ -157,21 +157,4 @@ def tle_status():
 
 @app.get("/v1/tle/refresh/progress")
 def tle_refresh_progress():
-    return load_refresh_progress()
-
-from fastapi import APIRouter
-import json
-from pathlib import Path
-
-router = APIRouter()
-
-@router.get("/v1/tle/refresh/progress")
-def refresh_progress():
-    p = Path("data/refresh_progress.json")
-    if not p.exists():
-        return {"state": "idle"}
-    try:
-        return json.loads(p.read_text())
-    except Exception as e:
-        return {"state": "unknown", "error": str(e)}
-    
+    return load_refresh_progress()    

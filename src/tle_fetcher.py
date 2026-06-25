@@ -269,6 +269,7 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
     """
     Refresh the local TLE database using Space-Track gp_history,
     then ingest results into the same local database used by the existing frontend.
+    Writes live progress to data/refresh_progress.json.
     """
     import os
     import json
@@ -281,126 +282,275 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
     Path("data").mkdir(exist_ok=True)
 
     started_at = time.time()
-
-    _write_refresh_progress(
-        state="starting",
-        group=group,
-        days=days,
-        pct=0,
-        message="Starting TLE refresh.",
-        started_at=started_at,
-    )
-
     logs = []
+    progress_context = {}
 
-    def emit(msg, pct=None):
+    def emit(msg, pct=None, state=None, **extra):
+        """
+        Central progress writer.
+
+        Important:
+        - Preserves previous counters such as n_objects, batches_done,
+          batches_total, fetched_tles, expected, ingested.
+        - Allows ingest_tles() to update progress without erasing earlier fields.
+        """
         logs.append(str(msg))
+
+        if state is not None:
+            progress_context["state"] = state
+
+        for key, value in extra.items():
+            if value is not None:
+                progress_context[key] = value
+
+        payload_extra = {
+            k: v for k, v in progress_context.items()
+            if k != "state"
+        }
+
         _write_refresh_progress(
-            state="running",
+            state=progress_context.get("state", "running"),
             group=group,
             days=days,
             pct=pct,
             message=str(msg),
             logs_tail=logs[-10:],
             started_at=started_at,
+            **payload_extra,
         )
 
-    def parse_tle_text(raw: str):
-        lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        tles = []
-        i = 0
-        while i + 2 < len(lines):
-            name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
-            if l1.startswith("1 ") and l2.startswith("2 "):
-                tles.append((name, l1, l2))
-            i += 3
-        return tles
+    emit(
+        "Starting TLE refresh.",
+        pct=0,
+        state="starting",
+    )
 
-    # Ensure compatibility with the existing SpaceTrackSession credential names.
-    # Your Codespace currently uses SPACETRACK_USER / SPACETRACK_PASS,
-    # while scripts/spacetrack.py expects SPACETRACK_EMAIL / SPACETRACK_PASSWORD.
-    if os.environ.get("SPACETRACK_USER") and not os.environ.get("SPACETRACK_EMAIL"):
-        os.environ["SPACETRACK_EMAIL"] = os.environ["SPACETRACK_USER"]
+    try:
+        # Ensure compatibility with the existing SpaceTrackSession credential names.
+        # Codespaces may use SPACETRACK_USER / SPACETRACK_PASS while
+        # scripts/spacetrack.py expects SPACETRACK_EMAIL / SPACETRACK_PASSWORD.
+        if os.environ.get("SPACETRACK_USER") and not os.environ.get("SPACETRACK_EMAIL"):
+            os.environ["SPACETRACK_EMAIL"] = os.environ["SPACETRACK_USER"]
 
-    if os.environ.get("SPACETRACK_PASS") and not os.environ.get("SPACETRACK_PASSWORD"):
-        os.environ["SPACETRACK_PASSWORD"] = os.environ["SPACETRACK_PASS"]
+        if os.environ.get("SPACETRACK_PASS") and not os.environ.get("SPACETRACK_PASSWORD"):
+            os.environ["SPACETRACK_PASSWORD"] = os.environ["SPACETRACK_PASS"]
 
-    all_tles = []
-    source_used = "Space-Track gp_history"
+        all_tles = []
+        source_used = "Space-Track gp_history"
 
-    with SpaceTrackSession() as client:
-        now_dt = datetime.now(timezone.utc)
-        end_str = now_dt.strftime("%Y-%m-%d")
-        start_hist = (now_dt - timedelta(days=days)).strftime("%Y-%m-%d")
+        def parse_tle_text(raw: str):
+            lines = [line.strip() for line in raw.splitlines() if line.strip()]
+            tles = []
 
-        emit("[INFO] Recuperation liste satellites LEO actifs via Space-Track gp", 5)
+            i = 0
+            while i + 2 < len(lines):
+                name, line1, line2 = lines[i], lines[i + 1], lines[i + 2]
+                if line1.startswith("1 ") and line2.startswith("2 "):
+                    tles.append((name, line1, line2))
+                i += 3
 
-        url_list = (
-            "https://www.space-track.org/basicspacedata/query"
-            "/class/gp/EPOCH/%3Enow-2"
-            "/MEAN_MOTION/%3E11.25/ECCENTRICITY/%3C0.25"
-            "/OBJECT_TYPE/payload,debris"
-            "/orderby/NORAD_CAT_ID/format/tle"
+            return tles
+
+        emit(
+            "Opening Space-Track session...",
+            pct=2,
+            state="opening_spacetrack_session",
         )
 
-        raw_list = client._request(url_list).decode("utf-8", errors="ignore")
-        tles_current = parse_tle_text(raw_list) if raw_list and len(raw_list) > 200 else []
+        with SpaceTrackSession() as client:
+            emit(
+                "Space-Track session opened.",
+                pct=4,
+                state="spacetrack_session_opened",
+            )
+            now_dt = datetime.now(timezone.utc)
+            end_str = now_dt.strftime("%Y-%m-%d")
+            start_hist = (now_dt - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        norad_ids = list(set(t[1][2:7].strip() for t in tles_current))
-        emit(f"[OK] {len(norad_ids)} objets LEO identifies", 15)
-
-        if not norad_ids:
-            raise ValueError("Aucun objet LEO trouve via Space-Track gp")
-
-        all_tles.extend(tles_current)
-
-        batch_size = 500
-        batches = [norad_ids[i:i + batch_size] for i in range(0, len(norad_ids), batch_size)]
-        emit(f"[INFO] {len(batches)} batches de {batch_size} objets", 20)
-
-        for b_idx, batch in enumerate(batches):
-            pct = 20 + int(b_idx / max(len(batches), 1) * 55)
-            norad_str = ",".join(batch)
-
-            url_hist = (
-                "https://www.space-track.org/basicspacedata/query"
-                f"/class/gp_history/NORAD_CAT_ID/{norad_str}"
-                f"/EPOCH/{start_hist}--{end_str}"
-                "/orderby/NORAD_CAT_ID%20asc,EPOCH%20asc/format/tle"
+            emit(
+                "Querying Space-Track current LEO catalog...",
+                pct=5,
+                state="fetching_current_catalog",
             )
 
-            try:
-                raw_h = client._request(url_hist).decode("utf-8", errors="ignore")
-                batch_tles = parse_tle_text(raw_h) if raw_h and len(raw_h) > 100 else []
-                all_tles.extend(batch_tles)
+            url_list = (
+                "https://www.space-track.org/basicspacedata/query"
+                "/class/gp/EPOCH/%3Enow-2"
+                "/MEAN_MOTION/%3E11.25/ECCENTRICITY/%3C0.25"
+                "/OBJECT_TYPE/payload,debris"
+                "/orderby/NORAD_CAT_ID/format/tle"
+            )
 
-                _write_refresh_progress(
-                    state="fetching_history",
-                    group=group,
-                    days=days,
-                    pct=pct,
-                    message=f"Batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE",
-                    batches_done=b_idx + 1,
-                    batches_total=len(batches),
-                    fetched_tles=len(all_tles),
-                    started_at=started_at,
+            raw_list = client._request(url_list).decode("utf-8", errors="ignore")
+            tles_current = parse_tle_text(raw_list) if raw_list and len(raw_list) > 200 else []
+
+            norad_ids = sorted(set(tle[1][2:7].strip() for tle in tles_current))
+
+            emit(
+                f"{len(norad_ids)} LEO objects identified.",
+                pct=15,
+                state="current_catalog_received",
+                n_objects=len(norad_ids),
+                fetched_tles=len(tles_current),
+            )
+
+            if not norad_ids:
+                raise ValueError("Aucun objet LEO trouvé via Space-Track gp")
+
+            all_tles.extend(tles_current)
+
+            batch_size = 500
+            batches = [
+                norad_ids[i:i + batch_size]
+                for i in range(0, len(norad_ids), batch_size)
+            ]
+
+            emit(
+                f"{len(batches)} Space-Track history batches to fetch.",
+                pct=20,
+                state="fetching_history",
+                n_objects=len(norad_ids),
+                batches_done=0,
+                batches_total=len(batches),
+                fetched_tles=len(all_tles),
+            )
+
+            for b_idx, batch in enumerate(batches):
+                pct = 20 + int(((b_idx + 1) / max(len(batches), 1)) * 55)
+                norad_str = ",".join(batch)
+
+                url_hist = (
+                    "https://www.space-track.org/basicspacedata/query"
+                    f"/class/gp_history/NORAD_CAT_ID/{norad_str}"
+                    f"/EPOCH/{start_hist}--{end_str}"
+                    "/orderby/NORAD_CAT_ID%20asc,EPOCH%20asc/format/tle"
                 )
 
-                emit(f"[INFO] Batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE", pct)
-            except Exception as be:
-                emit(f"[WARN] Batch {b_idx + 1} failed: {be}", pct)
-            except Exception as e:
-                _write_refresh_progress(
-                    state="error",
-                    group=group,
-                    days=days,
-                    pct=0,
-                    message="TLE refresh failed.",
-                    error=str(e),
-                    started_at=started_at,
-                    finished_at=time.time(),
-                )
-                raise
+                try:
+                    raw_h = client._request(url_hist).decode("utf-8", errors="ignore")
+                    batch_tles = parse_tle_text(raw_h) if raw_h and len(raw_h) > 100 else []
+                    all_tles.extend(batch_tles)
+
+                    emit(
+                        f"Batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE",
+                        pct=pct,
+                        state="fetching_history",
+                        n_objects=len(norad_ids),
+                        batches_done=b_idx + 1,
+                        batches_total=len(batches),
+                        fetched_tles=len(all_tles),
+                    )
+
+                except Exception as batch_error:
+                    emit(
+                        f"Batch {b_idx + 1}/{len(batches)} failed: {batch_error}",
+                        pct=pct,
+                        state="fetching_history",
+                        n_objects=len(norad_ids),
+                        batches_done=b_idx + 1,
+                        batches_total=len(batches),
+                        fetched_tles=len(all_tles),
+                        last_batch_error=str(batch_error),
+                    )
+
+        emit(
+            f"Deduplicating {len(all_tles)} TLE records...",
+            pct=77,
+            state="deduplicating",
+            fetched_tles=len(all_tles),
+        )
+
+        seen = set()
+        unique_tles = []
+
+        for tle in all_tles:
+            key = tle[1][2:7].strip() + "|" + tle[1][18:32]
+            if key not in seen:
+                seen.add(key)
+                unique_tles.append(tle)
+
+        all_tles = unique_tles
+
+        emit(
+            f"Ingesting {len(all_tles)} unique TLE records into local database...",
+            pct=80,
+            state="ingesting",
+            fetched_tles=len(all_tles),
+            expected=len(all_tles),
+            ingested=0,
+        )
+
+        report = ingest_tles(
+            all_tles,
+            source=source_used,
+            emit=emit,
+        )
+
+        stats = get_stats()
+
+        status = {
+            "ok": True,
+            "group": group,
+            "source": source_used,
+            "days": days,
+            "last_fetched_at": datetime.now(timezone.utc).isoformat(),
+            "n_tles_fetched": len(all_tles),
+            "report": report,
+            "stats": stats,
+            "logs_tail": logs[-30:],
+        }
+
+        Path("data/tle_status.json").write_text(
+            json.dumps(status, indent=2),
+            encoding="utf-8",
+        )
+
+        _write_refresh_progress(
+            state="done",
+            group=group,
+            days=days,
+            pct=100,
+            message="TLE refresh completed.",
+            n_objects=progress_context.get("n_objects"),
+            batches_done=progress_context.get("batches_done"),
+            batches_total=progress_context.get("batches_total"),
+            fetched_tles=len(all_tles),
+            ingested=report.get("total", len(all_tles)),
+            expected=len(all_tles),
+            added=report.get("added"),
+            skipped=report.get("skipped"),
+            errors=report.get("errors"),
+            report=report,
+            stats=stats,
+            logs_tail=logs[-10:],
+            started_at=started_at,
+            finished_at=time.time(),
+        )
+
+        return status
+
+    except Exception as e:
+        logger.exception("TLE refresh failed")
+
+        payload_extra = {
+            k: v for k, v in progress_context.items()
+            if k != "state"
+        }
+
+        _write_refresh_progress(
+            state="error",
+            group=group,
+            days=days,
+            pct=progress_context.get("pct", 0),
+            message="TLE refresh failed.",
+            error=str(e),
+            logs_tail=logs[-10:],
+            started_at=started_at,
+            finished_at=time.time(),
+            **payload_extra,
+        )
+
+        raise
 
     # Deduplicate by NORAD + epoch
     seen = set()

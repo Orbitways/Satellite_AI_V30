@@ -140,9 +140,20 @@ def ingest_tles(tles: list, source: str = "spacetrack", emit=None) -> dict:
                 errors += 1
                 logger.debug(f"Ingest erreur {name}: {e}")
 
-            if emit and i % 500 == 0:
-                pct = int(i / len(tles) * 80)
-                emit(f"Ingestion {i+1}/{len(tles)}...", pct)
+            if emit and (i % 500 == 0 or i == len(tles) - 1):
+                pct = 80 + int(((i + 1) / max(len(tles), 1)) * 15)
+                msg = f"Ingestion {i + 1}/{len(tles)}..."
+
+                try:
+                    emit(
+                        msg,
+                        pct,
+                        state="ingesting",
+                        ingested=i + 1,
+                        expected=len(tles),
+                    )
+                except TypeError:
+                    emit(msg, pct)
 
         conn.commit()
 
@@ -159,7 +170,22 @@ def ingest_tles(tles: list, source: str = "spacetrack", emit=None) -> dict:
         "total": added + skipped,
         "timestamp": now,
     }
-    if emit: emit(f"✓ {added} TLE ajoutés, {skipped} déjà présents", 85)
+    if emit:
+        msg = f"✓ {added} TLE ajoutés, {skipped} déjà présents"
+
+        try:
+            emit(
+                msg,
+                95,
+                state="ingesting",
+                ingested=added + skipped,
+                expected=len(tles),
+                added=added,
+                skipped=skipped,
+                errors=errors,
+            )
+        except TypeError:
+            emit(msg, 95)
     return report
 
 
