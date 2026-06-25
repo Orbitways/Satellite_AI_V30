@@ -401,3 +401,46 @@ def load_catalog_status():
             "status": "status_read_error",
             "message": str(e),
         }
+
+# src/tle_fetcher.py
+import json, time
+from pathlib import Path
+
+PROGRESS_PATH = Path("data/refresh_progress.json")
+PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def _write_progress(**kw):
+    payload = {"updated_at": time.time(), **kw}
+    tmp = PROGRESS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(PROGRESS_PATH)
+
+def refresh_from_spacetrack_gp_history(group: str = "starlink",
+                                       days: int = 30,
+                                       emit=None) -> dict:
+    started = time.time()
+    _write_progress(state="starting", group=group, ingested=0,
+                    expected=None, started_at=started)
+
+    # 1) fetch
+    _write_progress(state="fetching", group=group, ingested=0,
+                    expected=None, started_at=started,
+                    message="Querying Space-Track gp_history…")
+    records = _fetch_gp_history(group=group, days=days)   # existing logic
+    expected = len(records)
+
+    # 2) ingest in chunks so the count actually moves
+    CHUNK = 500
+    ingested = 0
+    for i in range(0, expected, CHUNK):
+        batch = records[i:i + CHUNK]
+        ingest_tles(batch, source=f"spacetrack:{group}", emit=emit)
+        ingested += len(batch)
+        _write_progress(state="ingesting", group=group,
+                        ingested=ingested, expected=expected,
+                        started_at=started)
+
+    _write_progress(state="done", group=group,
+                    ingested=ingested, expected=expected,
+                    started_at=started, finished_at=time.time())
+    return {"ok": True, "group": group, "ingested": ingested}

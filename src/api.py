@@ -2956,3 +2956,18 @@ def _start_rt_propagation_thread(app_ref):
     return t
 
 
+from fastapi import APIRouter
+import json
+from pathlib import Path
+
+router = APIRouter()
+
+@router.get("/v1/tle/refresh/progress")
+def refresh_progress():
+    p = Path("data/refresh_progress.json")
+    if not p.exists():
+        return {"state": "idle"}
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        return {"state": "unknown", "error": str(e)}
