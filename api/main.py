@@ -17,7 +17,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from conjunction import run_conjunction_analysis  # noqa: E402
-from tle_fetcher import fetch_and_store, load_catalog_status  # noqa: E402
+from tle_fetcher import fetch_and_store, load_catalog_status
 
 app = FastAPI(
     title="Orbitways Insurer API",
@@ -150,3 +150,19 @@ def refresh_tle(
 @app.get("/v1/tle/status")
 def tle_status():
     return load_catalog_status()
+
+from fastapi import APIRouter
+import json
+from pathlib import Path
+
+router = APIRouter()
+
+@router.get("/v1/tle/refresh/progress")
+def refresh_progress():
+    p = Path("data/refresh_progress.json")
+    if not p.exists():
+        return {"state": "idle"}
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        return {"state": "unknown", "error": str(e)}
