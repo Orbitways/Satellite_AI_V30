@@ -226,6 +226,55 @@ def get_history(norad_id: str, limit: int = 50) -> list:
     finally:
         conn.close()
 
+def lookup_tle(q: str, limit: int = 10) -> list:
+    """
+    Lookup latest TLE records by NORAD ID or satellite name.
+
+    Returns one latest TLE per matched NORAD object.
+    """
+    init_db()
+
+    q = (q or "").strip()
+    if not q:
+        return []
+
+    limit = max(1, min(int(limit), 50))
+
+    conn = get_connection()
+    try:
+        if q.isdigit():
+            rows = conn.execute(
+                """
+                SELECT norad_id, name, tle1, tle2, epoch, alt_km, orbit_class
+                FROM tle_records
+                WHERE norad_id = ?
+                ORDER BY epoch DESC
+                LIMIT ?
+                """,
+                (q, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT r.norad_id, r.name, r.tle1, r.tle2, r.epoch, r.alt_km, r.orbit_class
+                FROM tle_records r
+                JOIN (
+                    SELECT norad_id, MAX(epoch) AS latest_epoch
+                    FROM tle_records
+                    WHERE UPPER(name) LIKE UPPER(?)
+                    GROUP BY norad_id
+                    LIMIT ?
+                ) latest
+                ON r.norad_id = latest.norad_id
+                AND r.epoch = latest.latest_epoch
+                ORDER BY r.name ASC
+                """,
+                (f"%{q}%", limit),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 def store_maneuver(norad_id, name, delta_v_ms, residual_m,
                    epoch_before=None, epoch_after=None,

@@ -22,6 +22,7 @@ if SCRIPTS_DIR not in sys.path:
 
 from conjunction import run_conjunction_analysis  # noqa: E402
 from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progress
+from tle_database import lookup_tle
 
 app = FastAPI(
     title="Orbitways Insurer API",
@@ -158,3 +159,33 @@ def tle_status():
 @app.get("/v1/tle/refresh/progress")
 def tle_refresh_progress():
     return load_refresh_progress()    
+
+@app.get("/v1/tle/lookup")
+def tle_lookup(
+    q: str,
+    limit: int = 10,
+):
+    """
+    Lookup latest TLE records by NORAD ID or satellite name.
+
+    Used by the orbit visualization frontend.
+    """
+    q = q.strip()
+
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query parameter q")
+
+    try:
+        results = lookup_tle(q=q, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TLE lookup failed: {e}")
+
+    if not results:
+        raise HTTPException(status_code=404, detail=f"No TLE found for query: {q}")
+
+    return {
+        "ok": True,
+        "query": q,
+        "count": len(results),
+        "results": results,
+    }
