@@ -301,6 +301,8 @@ def leo_scene(
             for key, row in keyed_records
         ]
 
+        state_epoch_unix = time.time()
+
         cloud_states = propagate_all(
             cloud_tles,
             hours=0.001,
@@ -318,6 +320,7 @@ def leo_scene(
                 continue
 
             pos0 = state["pos_km"][0]
+            vel0 = state["vel_km_s"][0]
             alt_now = round(_norm_km(pos0) - RE_KM, 1)
 
             objects.append(
@@ -328,6 +331,7 @@ def leo_scene(
                     "orbit_class": row.get("orbit_class") or state.get("orbit_class"),
                     "alt_km": alt_now,
                     "position_km": _vec3(pos0),
+                    "velocity_km_s": _vec3(vel0),
                 }
             )
 
@@ -365,6 +369,7 @@ def leo_scene(
                     "period_min": _period_min_from_mean_motion(selected_record.get("mm")),
                     "current_position_km": _vec3(pos0),
                     "current_velocity_km_s": _vec3(vel0),
+                    "state_epoch_unix": state_epoch_unix,
                     "orbit_points_km": [
                         _vec3(point)
                         for point in selected_state["pos_km"]
@@ -376,6 +381,7 @@ def leo_scene(
         return {
             "ok": True,
             "server_time_utc": datetime.now(timezone.utc).isoformat(),
+            "state_epoch_unix": state_epoch_unix,
             "frame": "ECI",
             "earth_radius_km": RE_KM,
             "total_objects": len(records),
@@ -383,6 +389,13 @@ def leo_scene(
             "objects": objects,
             "selected": selected_payload,
             "selected_error": selected_error,
+            "motion": {
+                "model": "linear_velocity_interpolation_between_backend_sgp4_snapshots",
+                "velocity_units": "km/s",
+                "position_units": "km",
+                "recommended_refresh_s": 10,
+                "max_client_interpolation_s": 30,
+            },
         }
 
     except HTTPException:
