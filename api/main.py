@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import math
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -20,9 +21,9 @@ if SRC_DIR not in sys.path:
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
-from conjunction import run_conjunction_analysis  # noqa: E402
+from conjunction import run_conjunction_analysis, propagate_all, RE_KM  # noqa: E402
 from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progress
-from tle_database import lookup_tle
+from tle_database import lookup_tle, get_latest_tles
 
 app = FastAPI(
     title="Orbitways Insurer API",
@@ -189,3 +190,206 @@ def tle_lookup(
         "count": len(results),
         "results": results,
     }
+
+def _vec3(values):
+    return [float(values[0]), float(values[1]), float(values[2])]
+
+
+def _norm_km(values):
+    return math.sqrt(sum(float(x) * float(x) for x in values))
+
+
+def _float_or_none(value):
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _period_min_from_mean_motion(mm):
+    mm = _float_or_none(mm)
+
+    if not mm or mm <= 0:
+        return None
+
+    return round(1440.0 / mm, 2)
+
+
+def _scene_key(row):
+    return f"{row.get('norad_id')}::{row.get('name', '')}"
+
+
+def _guess_object_type(name: str | None):
+    """
+    Best-effort classification.
+
+    The current DB does not store Space-Track OBJECT_TYPE directly, so this
+    is only a display heuristic. If OBJECT_TYPE is added later to the DB,
+    replace this function with the real catalog field.
+    """
+    n = (name or "").upper()
+
+    if "DEB" in n or "DEBRIS" in n:
+        return "debris"
+
+    if "R/B" in n or "ROCKET BODY" in n or "ROCKET" in n:
+        return "rocket_body"
+
+    return "payload_active"
+
+@app.get("/v1/leo/scene")
+def leo_scene(
+    selected_norad: Optional[str] = None,
+    max_objects: int = 30000,
+):
+    """
+    Build the real-time 3D LEO scene for the frontend.
+
+    This endpoint returns:
+    - one current propagated position per LEO object
+    - optional selected satellite metadata
+    - optional selected satellite orbit points
+
+    The frontend renders the 3D scene; the backend provides the physics data.
+    """
+    max_objects = max(1, min(int(max_objects), 30000))
+    selected_norad = (selected_norad or "").strip()
+
+    try:
+        records = get_latest_tles(limit=max_objects, orbit_class="LEO")
+
+        selected_record = None
+        selected_error = None
+
+        if selected_norad:
+            selected_matches = lookup_tle(q=selected_norad, limit=1)
+            selected_record = selected_matches[0] if selected_matches else None
+
+            if selected_record:
+                existing_norads = {row["norad_id"] for row in records}
+
+                if selected_record["norad_id"] not in existing_norads:
+                    records.append(selected_record)
+            else:
+                selected_error = f"No TLE found for NORAD ID {selected_norad}"
+
+        if not records:
+            raise HTTPException(
+                status_code=404,
+                detail="No LEO TLE records available. Refresh the TLE database first.",
+            )
+
+        keyed_records = []
+        seen_keys = set()
+
+        for row in records:
+            key = _scene_key(row)
+
+            if key in seen_keys:
+                continue
+
+            seen_keys.add(key)
+            keyed_records.append((key, row))
+
+        # Current cloud position: use one SGP4 sample only.
+        # Very short horizon + 1-minute step gives one current propagated point.
+        cloud_tles = [
+            (key, row["tle1"], row["tle2"])
+            for key, row in keyed_records
+        ]
+
+        cloud_states = propagate_all(
+            cloud_tles,
+            hours=0.001,
+            step_min=1.0,
+            pert_flags=None,
+            emit=None,
+        )
+
+        objects = []
+
+        for key, row in keyed_records:
+            state = cloud_states.get(key)
+
+            if not state:
+                continue
+
+            pos0 = state["pos_km"][0]
+            alt_now = round(_norm_km(pos0) - RE_KM, 1)
+
+            objects.append(
+                {
+                    "norad_id": str(row["norad_id"]),
+                    "name": row["name"],
+                    "object_type": _guess_object_type(row.get("name")),
+                    "orbit_class": row.get("orbit_class") or state.get("orbit_class"),
+                    "alt_km": alt_now,
+                    "position_km": _vec3(pos0),
+                }
+            )
+
+        selected_payload = None
+
+        if selected_record:
+            selected_key = _scene_key(selected_record)
+
+            selected_states = propagate_all(
+                [(selected_key, selected_record["tle1"], selected_record["tle2"])],
+                hours=2.0,
+                step_min=2.0,
+                pert_flags=None,
+                emit=None,
+            )
+
+            selected_state = selected_states.get(selected_key)
+
+            if selected_state:
+                pos0 = selected_state["pos_km"][0]
+                vel0 = selected_state["vel_km_s"][0]
+
+                selected_payload = {
+                    "norad_id": str(selected_record["norad_id"]),
+                    "name": selected_record["name"],
+                    "tle1": selected_record["tle1"],
+                    "tle2": selected_record["tle2"],
+                    "epoch": selected_record.get("epoch"),
+                    "orbit_class": selected_record.get("orbit_class") or selected_state.get("orbit_class"),
+                    "alt_km": round(_norm_km(pos0) - RE_KM, 1),
+                    "catalog_alt_km": _float_or_none(selected_record.get("alt_km")),
+                    "inc": _float_or_none(selected_record.get("inc")),
+                    "ecc": _float_or_none(selected_record.get("ecc")),
+                    "mm": _float_or_none(selected_record.get("mm")),
+                    "period_min": _period_min_from_mean_motion(selected_record.get("mm")),
+                    "current_position_km": _vec3(pos0),
+                    "current_velocity_km_s": _vec3(vel0),
+                    "orbit_points_km": [
+                        _vec3(point)
+                        for point in selected_state["pos_km"]
+                    ],
+                }
+            else:
+                selected_error = f"Propagation failed for NORAD ID {selected_norad}"
+
+        return {
+            "ok": True,
+            "server_time_utc": datetime.now(timezone.utc).isoformat(),
+            "frame": "ECI",
+            "earth_radius_km": RE_KM,
+            "total_objects": len(records),
+            "rendered_objects": len(objects),
+            "objects": objects,
+            "selected": selected_payload,
+            "selected_error": selected_error,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"LEO scene generation failed: {e}",
+        )

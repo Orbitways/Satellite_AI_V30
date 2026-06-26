@@ -218,7 +218,7 @@ def get_history(norad_id: str, limit: int = 50) -> list:
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT norad_id, name, tle1, tle2, epoch, alt_km, orbit_class
+            SELECT norad_id, name, tle1, tle2, epoch, alt_km, orbit_class, mm, inc, ecc, source, ingested_at
             FROM tle_records WHERE norad_id=?
             ORDER BY epoch DESC LIMIT ?
         """, (norad_id, limit)).fetchall()
@@ -245,7 +245,7 @@ def lookup_tle(q: str, limit: int = 10) -> list:
         if q.isdigit():
             rows = conn.execute(
                 """
-                SELECT norad_id, name, tle1, tle2, epoch, alt_km, orbit_class
+                SELECT norad_id, name, tle1, tle2, epoch, alt_km, orbit_class, mm, inc, ecc, source, ingested_at
                 FROM tle_records
                 WHERE norad_id = ?
                 ORDER BY epoch DESC
@@ -270,6 +270,64 @@ def lookup_tle(q: str, limit: int = 10) -> list:
                 ORDER BY r.name ASC
                 """,
                 (f"%{q}%", limit),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+def get_latest_tles(limit: int = 30000, orbit_class: str | None = "LEO") -> list:
+    """
+    Return the latest TLE record per NORAD object.
+
+    Used by /v1/leo/scene to build the full LEO visualization cloud.
+    """
+    init_db()
+
+    limit = max(1, min(int(limit), 50000))
+
+    conn = get_connection()
+    try:
+        if orbit_class:
+            rows = conn.execute(
+                """
+                SELECT r.norad_id, r.name, r.tle1, r.tle2, r.epoch,
+                       r.alt_km, r.orbit_class, r.mm, r.inc, r.ecc,
+                       r.source, r.ingested_at
+                FROM tle_records r
+                JOIN (
+                    SELECT norad_id, MAX(epoch) AS latest_epoch
+                    FROM tle_records
+                    WHERE orbit_class = ?
+                    GROUP BY norad_id
+                    ORDER BY norad_id
+                    LIMIT ?
+                ) latest
+                ON r.norad_id = latest.norad_id
+                AND r.epoch = latest.latest_epoch
+                ORDER BY r.norad_id
+                """,
+                (orbit_class, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT r.norad_id, r.name, r.tle1, r.tle2, r.epoch,
+                       r.alt_km, r.orbit_class, r.mm, r.inc, r.ecc,
+                       r.source, r.ingested_at
+                FROM tle_records r
+                JOIN (
+                    SELECT norad_id, MAX(epoch) AS latest_epoch
+                    FROM tle_records
+                    GROUP BY norad_id
+                    ORDER BY norad_id
+                    LIMIT ?
+                ) latest
+                ON r.norad_id = latest.norad_id
+                AND r.epoch = latest.latest_epoch
+                ORDER BY r.norad_id
+                """,
+                (limit,),
             ).fetchall()
 
         return [dict(row) for row in rows]
