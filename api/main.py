@@ -24,10 +24,11 @@ if SCRIPTS_DIR not in sys.path:
 from conjunction import run_conjunction_analysis, propagate_all, RE_KM  # noqa: E402
 from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progress
 from tle_database import lookup_tle, get_latest_tles
+from underwriting import run_target_risk_analysis
 
 app = FastAPI(
     title="Orbitways Insurer API",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -68,11 +69,26 @@ class AssessmentRequest(BaseModel):
     pc_method: Literal["foster", "patera", "montecarlo"] = "foster"
 
 
+class TargetRiskRequest(BaseModel):
+    target_norad: str = Field(..., min_length=1, max_length=10)
+    horizon_days: float = Field(7, ge=0.25, le=30)
+    step_min: float = Field(30, ge=1, le=180)
+    screening_miss_distance_threshold_km: float = Field(10, ge=0.1, le=100)
+    cdm_pc_threshold: float = Field(1e-7, gt=0, le=1)
+    cdm_miss_distance_threshold_km: float = Field(5, ge=0.1, le=100)
+    maneuver_pc_threshold: float = Field(1e-4, gt=0, le=1)
+    maneuver_miss_distance_threshold_km: float = Field(1, ge=0.01, le=100)
+    catalog_orbit_class: Optional[str] = Field("LEO", max_length=8)
+    max_catalog_objects: int = Field(30000, ge=2, le=50000)
+    max_events: int = Field(50, ge=1, le=500)
+    pc_method: Literal["foster", "patera", "montecarlo"] = "foster"
+
+
 @app.get("/")
 def root():
     return {
         "service": "Orbitways Insurer API",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "docs": "/docs",
         "health": "/health",
     }
@@ -136,6 +152,91 @@ def assessments(
     }
 
 
+@app.post("/v1/underwriting/target-risk")
+def underwriting_target_risk(
+    req: TargetRiskRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Target-centric underwriting baseline.
+
+    Given one NORAD ID, propagate the target against the local TLE catalog and
+    return annualized conjunction/CDM-equivalent/maneuver indicators. This is
+    the backend contract intended to feed the UI section "Underwriting outputs".
+    """
+    _check_auth(authorization)
+
+    t0 = time.time()
+    target_norad = (req.target_norad or "").strip()
+
+    if not target_norad.isdigit():
+        raise HTTPException(status_code=400, detail="target_norad must be numeric")
+
+    raw_class = (req.catalog_orbit_class or "").strip().upper()
+    if raw_class in ("", "ALL", "ANY", "NONE", "NULL"):
+        catalog_orbit_class = None
+    elif raw_class in ("LEO", "MEO", "GEO", "HEO"):
+        catalog_orbit_class = raw_class
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="catalog_orbit_class must be one of LEO, MEO, GEO, HEO or ALL",
+        )
+
+    try:
+        target_matches = lookup_tle(q=target_norad, limit=1)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"target TLE lookup failed: {e}")
+
+    if not target_matches:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No TLE found for target NORAD ID {target_norad}. Refresh the TLE database first.",
+        )
+
+    try:
+        catalog_records = get_latest_tles(
+            limit=req.max_catalog_objects,
+            orbit_class=catalog_orbit_class,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"catalog TLE lookup failed: {e}")
+
+    if not catalog_records:
+        raise HTTPException(
+            status_code=404,
+            detail="No catalog TLE records available. Refresh the TLE database first.",
+        )
+
+    try:
+        result = run_target_risk_analysis(
+            target_record=target_matches[0],
+            catalog_records=catalog_records,
+            horizon_days=req.horizon_days,
+            step_min=req.step_min,
+            screening_miss_distance_threshold_km=req.screening_miss_distance_threshold_km,
+            cdm_pc_threshold=req.cdm_pc_threshold,
+            cdm_miss_distance_threshold_km=req.cdm_miss_distance_threshold_km,
+            maneuver_pc_threshold=req.maneuver_pc_threshold,
+            maneuver_miss_distance_threshold_km=req.maneuver_miss_distance_threshold_km,
+            pc_method=req.pc_method,
+            max_events=req.max_events,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"target risk analysis failed: {e}")
+
+    result["catalog"]["orbit_class_filter"] = catalog_orbit_class or "ALL"
+    result["catalog"]["requested_max_objects"] = req.max_catalog_objects
+
+    return {
+        "ok": True,
+        "source": "local_tle_database",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_s": round(time.time() - t0, 2),
+        **result,
+    }
+
+
 @app.post("/v1/tle/refresh")
 def refresh_tle(
     bg: BackgroundTasks,
@@ -191,6 +292,7 @@ def tle_lookup(
         "results": results,
     }
 
+
 def _vec3(values):
     return [float(values[0]), float(values[1]), float(values[2])]
 
@@ -239,6 +341,7 @@ def _guess_object_type(name: str | None):
         return "rocket_body"
 
     return "payload_active"
+
 
 @app.get("/v1/leo/scene")
 def leo_scene(
