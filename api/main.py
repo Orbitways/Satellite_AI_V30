@@ -25,10 +25,11 @@ from conjunction import run_conjunction_analysis, propagate_all, RE_KM  # noqa: 
 from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progress
 from tle_database import lookup_tle, get_latest_tles
 from underwriting import run_target_risk_analysis
+from historical_underwriting import run_historical_target_risk
 
 app = FastAPI(
     title="Orbitways Insurer API",
-    version="0.3.0",
+    version="0.4.0",
 )
 
 app.add_middleware(
@@ -60,6 +61,21 @@ def _check_auth(authorization: Optional[str]):
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
+def _parse_catalog_orbit_class(value: Optional[str]):
+    raw_class = (value or "").strip().upper()
+
+    if raw_class in ("", "ALL", "ANY", "NONE", "NULL"):
+        return None
+
+    if raw_class in ("LEO", "MEO", "GEO", "HEO"):
+        return raw_class
+
+    raise HTTPException(
+        status_code=400,
+        detail="catalog_orbit_class must be one of LEO, MEO, GEO, HEO or ALL",
+    )
+
+
 class AssessmentRequest(BaseModel):
     constellation: str = Field("starlink", max_length=64)
     hours: float = Field(24, ge=1, le=168)
@@ -84,11 +100,29 @@ class TargetRiskRequest(BaseModel):
     pc_method: Literal["foster", "patera", "montecarlo"] = "foster"
 
 
+class HistoricalTargetRiskRequest(BaseModel):
+    target_norad: str = Field(..., min_length=1, max_length=10)
+    lookback_days: float = Field(90, ge=1, le=365)
+    bucket_days: float = Field(7, ge=1, le=30)
+    step_min: float = Field(60, ge=5, le=360)
+    screening_miss_distance_threshold_km: float = Field(10, ge=0.1, le=100)
+    cdm_pc_threshold: float = Field(1e-7, gt=0, le=1)
+    cdm_miss_distance_threshold_km: float = Field(5, ge=0.1, le=100)
+    maneuver_pc_threshold: float = Field(1e-4, gt=0, le=1)
+    maneuver_miss_distance_threshold_km: float = Field(1, ge=0.01, le=100)
+    catalog_orbit_class: Optional[str] = Field("LEO", max_length=8)
+    max_catalog_objects: int = Field(8000, ge=100, le=50000)
+    max_tle_age_days: float = Field(14, ge=1, le=90)
+    altitude_band_km: Optional[float] = Field(300, ge=10, le=2000)
+    max_events_per_bucket: int = Field(20, ge=1, le=200)
+    pc_method: Literal["foster", "patera", "montecarlo"] = "foster"
+
+
 @app.get("/")
 def root():
     return {
         "service": "Orbitways Insurer API",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "docs": "/docs",
         "health": "/health",
     }
@@ -157,13 +191,6 @@ def underwriting_target_risk(
     req: TargetRiskRequest,
     authorization: Optional[str] = Header(None),
 ):
-    """
-    Target-centric underwriting baseline.
-
-    Given one NORAD ID, propagate the target against the local TLE catalog and
-    return annualized conjunction/CDM-equivalent/maneuver indicators. This is
-    the backend contract intended to feed the UI section "Underwriting outputs".
-    """
     _check_auth(authorization)
 
     t0 = time.time()
@@ -172,16 +199,7 @@ def underwriting_target_risk(
     if not target_norad.isdigit():
         raise HTTPException(status_code=400, detail="target_norad must be numeric")
 
-    raw_class = (req.catalog_orbit_class or "").strip().upper()
-    if raw_class in ("", "ALL", "ANY", "NONE", "NULL"):
-        catalog_orbit_class = None
-    elif raw_class in ("LEO", "MEO", "GEO", "HEO"):
-        catalog_orbit_class = raw_class
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="catalog_orbit_class must be one of LEO, MEO, GEO, HEO or ALL",
-        )
+    catalog_orbit_class = _parse_catalog_orbit_class(req.catalog_orbit_class)
 
     try:
         target_matches = lookup_tle(q=target_norad, limit=1)
@@ -237,6 +255,51 @@ def underwriting_target_risk(
     }
 
 
+@app.post("/v1/underwriting/historical-target-risk")
+def underwriting_historical_target_risk(
+    req: HistoricalTargetRiskRequest,
+    authorization: Optional[str] = Header(None),
+):
+    _check_auth(authorization)
+
+    t0 = time.time()
+    target_norad = (req.target_norad or "").strip()
+
+    if not target_norad.isdigit():
+        raise HTTPException(status_code=400, detail="target_norad must be numeric")
+
+    catalog_orbit_class = _parse_catalog_orbit_class(req.catalog_orbit_class)
+
+    try:
+        result = run_historical_target_risk(
+            target_norad=target_norad,
+            lookback_days=req.lookback_days,
+            bucket_days=req.bucket_days,
+            step_min=req.step_min,
+            screening_miss_distance_threshold_km=req.screening_miss_distance_threshold_km,
+            cdm_pc_threshold=req.cdm_pc_threshold,
+            cdm_miss_distance_threshold_km=req.cdm_miss_distance_threshold_km,
+            maneuver_pc_threshold=req.maneuver_pc_threshold,
+            maneuver_miss_distance_threshold_km=req.maneuver_miss_distance_threshold_km,
+            catalog_orbit_class=catalog_orbit_class,
+            max_catalog_objects=req.max_catalog_objects,
+            max_tle_age_days=req.max_tle_age_days,
+            altitude_band_km=req.altitude_band_km,
+            pc_method=req.pc_method,
+            max_events_per_bucket=req.max_events_per_bucket,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"historical target risk replay failed: {e}")
+
+    return {
+        "ok": True,
+        "source": "local_tle_history",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_s": round(time.time() - t0, 2),
+        **result,
+    }
+
+
 @app.post("/v1/tle/refresh")
 def refresh_tle(
     bg: BackgroundTasks,
@@ -258,20 +321,17 @@ def refresh_tle(
 def tle_status():
     return load_catalog_status()
 
+
 @app.get("/v1/tle/refresh/progress")
 def tle_refresh_progress():
-    return load_refresh_progress()    
+    return load_refresh_progress()
+
 
 @app.get("/v1/tle/lookup")
 def tle_lookup(
     q: str,
     limit: int = 10,
 ):
-    """
-    Lookup latest TLE records by NORAD ID or satellite name.
-
-    Used by the orbit visualization frontend.
-    """
     q = q.strip()
 
     if not q:
@@ -325,13 +385,6 @@ def _scene_key(row):
 
 
 def _guess_object_type(name: str | None):
-    """
-    Best-effort classification.
-
-    The current DB does not store Space-Track OBJECT_TYPE directly, so this
-    is only a display heuristic. If OBJECT_TYPE is added later to the DB,
-    replace this function with the real catalog field.
-    """
     n = (name or "").upper()
 
     if "DEB" in n or "DEBRIS" in n:
@@ -348,16 +401,6 @@ def leo_scene(
     selected_norad: Optional[str] = None,
     max_objects: int = 30000,
 ):
-    """
-    Build the real-time 3D LEO scene for the frontend.
-
-    This endpoint returns:
-    - one current propagated position per LEO object
-    - optional selected satellite metadata
-    - optional selected satellite orbit points
-
-    The frontend renders the 3D scene; the backend provides the physics data.
-    """
     max_objects = max(1, min(int(max_objects), 30000))
     selected_norad = (selected_norad or "").strip()
 
@@ -397,8 +440,6 @@ def leo_scene(
             seen_keys.add(key)
             keyed_records.append((key, row))
 
-        # Current cloud position: use one SGP4 sample only.
-        # Very short horizon + 1-minute step gives one current propagated point.
         cloud_tles = [
             (key, row["tle1"], row["tle2"])
             for key, row in keyed_records
