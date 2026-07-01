@@ -1,55 +1,23 @@
 """
-tle_fetcher.py — Ingestion de TLE depuis Celestrak ou fichier local.
+tle_fetcher.py — TLE and Space-Track catalog metadata ingestion.
 
-En production : utiliser Space-Track.org (compte requis) pour des TLE
-haute précision. Celestrak est suffisant pour du LEO standard.
+The refresh flow now stores two complementary datasets:
+- TLE history from Space-Track gp / gp_history;
+- SATCAT object metadata used to classify debris, rocket bodies and payloads.
 """
 
 import json
+import os
+import logging
 import time
 from pathlib import Path
-
-PROGRESS_PATH = Path("data/refresh_progress.json")
-
-
-def _write_refresh_progress(**kwargs):
-    PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "updated_at": time.time(),
-        "updated_at_iso": datetime.now(timezone.utc).isoformat(),
-        **kwargs,
-    }
-
-    tmp = PROGRESS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(PROGRESS_PATH)
-
-
-def load_refresh_progress():
-    if not PROGRESS_PATH.exists():
-        return {
-            "state": "idle",
-            "message": "No TLE refresh currently running.",
-        }
-
-    try:
-        return json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
-    except Exception as e:
-        return {
-            "state": "unknown",
-            "error": str(e),
-        }
-
-import os
-import re
-import logging
 from typing import List, Tuple, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
+PROGRESS_PATH = Path("data/refresh_progress.json")
 
-# TLE ISS réels (backup si pas d'accès réseau)
+# Backup TLE if no network / no database available.
 FALLBACK_TLES = [
     (
         "ISS (ZARYA)",
@@ -58,83 +26,58 @@ FALLBACK_TLES = [
     ),
 ]
 
-# URLs Celestrak par catégorie
-CELESTRAK_URLS = {
-    "stations":  "https://celestrak.org/SOCRATES/query.php?CATALOG=25544&NAME=ISS",
-    "active":    "https://celestrak.org/SOCRATES/query.php?CATALOG=active",
-    "starlink":  "https://celestrak.org/SOCRATES/query.php?CATALOG=starlink",
-}
+TLEEntry = Tuple[str, str, str]
 
 
-TLEEntry = Tuple[str, str, str]  # (name, line1, line2)
+def _write_refresh_progress(**kwargs):
+    PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": time.time(),
+        "updated_at_iso": datetime.now(timezone.utc).isoformat(),
+        **kwargs,
+    }
+    tmp = PROGRESS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(PROGRESS_PATH)
+
+
+def load_refresh_progress():
+    if not PROGRESS_PATH.exists():
+        return {"state": "idle", "message": "No TLE refresh currently running."}
+    try:
+        return json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"state": "unknown", "error": str(e)}
 
 
 def parse_tle_file(path: str) -> List[TLEEntry]:
-    """
-    Parse un fichier TLE au format 3-lignes standard.
-    Ignore les lignes vides et les commentaires (#).
-    Valide le format de chaque TLE avant de l'inclure.
-    """
     if not os.path.exists(path):
-        logger.warning(f"Fichier TLE introuvable : {path}. Utilisation du fallback.")
+        logger.warning(f"TLE file not found: {path}. Using fallback.")
         return FALLBACK_TLES
-
     entries: List[TLEEntry] = []
     with open(path, "r") as f:
         lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
     i = 0
     while i + 2 < len(lines):
-        name = lines[i]
-        line1 = lines[i + 1]
-        line2 = lines[i + 2]
-
+        name, line1, line2 = lines[i], lines[i + 1], lines[i + 2]
         if _validate_tle(line1, line2):
             entries.append((name, line1, line2))
-        else:
-            logger.warning(f"TLE invalide ignoré : {name}")
-
         i += 3
-
-    if not entries:
-        logger.warning("Aucun TLE valide trouvé. Utilisation du fallback.")
-        return FALLBACK_TLES
-
-    logger.info(f"[TLE] {len(entries)} satellite(s) chargé(s) depuis {path}")
-    return entries
+    return entries if entries else FALLBACK_TLES
 
 
 def fetch_celestrak(category: str = "stations") -> List[TLEEntry]:
-    """
-    Télécharge les TLE depuis Celestrak (format 3-lignes).
-    Nécessite une connexion réseau. Retourne FALLBACK_TLES en cas d'échec.
-    """
     try:
         import urllib.request
-        url = f"https://celestrak.org/SOCRATES/query.php?CATALOG={category}"
-        # URL standard Celestrak 3-line
-        url = f"https://celestrak.org/supplemental/query.php?FORMAT=tle"
-        # Utiliser l'URL correcte pour les TLE
-        url = f"https://celestrak.org/SOCRATES/query.php"
-
-        # URL propre Celestrak :
-        url = f"https://celestrak.org/pub/TLE/catalog.tle"
-        logger.info(f"Téléchargement TLE depuis Celestrak...")
-
+        url = "https://celestrak.org/pub/TLE/catalog.tle"
         with urllib.request.urlopen(url, timeout=10) as resp:
             content = resp.read().decode("utf-8")
-
-        # Sauvegarder localement pour cache
         cache_path = f"data/celestrak_{category}.txt"
         os.makedirs("data", exist_ok=True)
-        with open(cache_path, "w") as f:
-            f.write(content)
-
+        Path(cache_path).write_text(content, encoding="utf-8")
         return _parse_tle_string(content)
-
     except Exception as e:
-        logger.warning(f"Celestrak inaccessible ({e}). Utilisation du cache/fallback.")
-        # Essayer le cache local
+        logger.warning(f"Celestrak unavailable ({e}). Using cache/fallback.")
         cache_path = f"data/celestrak_{category}.txt"
         if os.path.exists(cache_path):
             return parse_tle_file(cache_path)
@@ -142,14 +85,11 @@ def fetch_celestrak(category: str = "stations") -> List[TLEEntry]:
 
 
 def _parse_tle_string(content: str) -> List[TLEEntry]:
-    """Parse un contenu TLE multi-satellites depuis une chaîne."""
     entries: List[TLEEntry] = []
     lines = [l.strip() for l in content.splitlines() if l.strip()]
     i = 0
     while i + 2 < len(lines):
-        name = lines[i]
-        line1 = lines[i + 1]
-        line2 = lines[i + 2]
+        name, line1, line2 = lines[i], lines[i + 1], lines[i + 2]
         if _validate_tle(line1, line2):
             entries.append((name, line1, line2))
         i += 3
@@ -157,24 +97,14 @@ def _parse_tle_string(content: str) -> List[TLEEntry]:
 
 
 def _validate_tle(line1: str, line2: str) -> bool:
-    """
-    Validation basique du format TLE :
-    - Ligne 1 commence par '1 '
-    - Ligne 2 commence par '2 '
-    - Longueur correcte
-    - Checksum valide
-    """
     if not (line1.startswith("1 ") and line2.startswith("2 ")):
         return False
     if len(line1) < 69 or len(line2) < 69:
         return False
-    if not (_checksum(line1) and _checksum(line2)):
-        return False
-    return True
+    return _checksum(line1) and _checksum(line2)
 
 
 def _checksum(line: str) -> bool:
-    """Vérifie le checksum TLE (modulo 10)."""
     if len(line) < 69:
         return False
     total = 0
@@ -187,127 +117,98 @@ def _checksum(line: str) -> bool:
 
 
 def get_tle_epoch(line1: str) -> Optional[datetime]:
-    """Extrait la date d'époque d'une ligne TLE 1."""
     try:
         epoch_str = line1[18:32].strip()
         year_2d = int(epoch_str[:2])
         year = 2000 + year_2d if year_2d < 57 else 1900 + year_2d
         day_of_year = float(epoch_str[2:])
         dt = datetime(year, 1, 1, tzinfo=timezone.utc)
-        from datetime import timedelta
         dt += timedelta(days=day_of_year - 1)
         return dt
     except Exception:
         return None
 
-def fetch_and_store(group: str = "starlink"):
-    """
-    Compatibility wrapper for the FastAPI TLE refresh endpoint.
 
-    This function is called by api/main.py when Lovable triggers:
-    POST /v1/tle/refresh
-    """
-    import json
-    from datetime import datetime, timezone
-    from pathlib import Path
+def _parse_tle_text(raw: str) -> list[TLEEntry]:
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    tles = []
+    i = 0
+    while i + 2 < len(lines):
+        name, line1, line2 = lines[i], lines[i + 1], lines[i + 2]
+        if line1.startswith("1 ") and line2.startswith("2 "):
+            tles.append((name, line1, line2))
+        i += 3
+    return tles
 
-    Path("data").mkdir(exist_ok=True)
 
-    result = fetch_celestrak(group=group)
+def _decode_response(raw) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="ignore")
+    return str(raw)
 
-    status = {
-        "ok": True,
-        "group": group,
-        "source": "celestrak",
-        "last_fetched_at": datetime.now(timezone.utc).isoformat(),
-        "result_type": type(result).__name__,
-    }
 
-    # Try to enrich status if fetch_celestrak returns useful metadata
-    if isinstance(result, dict):
-        status.update(result)
-    elif isinstance(result, list):
-        status["n_objects_estimated"] = len(result)
-    elif isinstance(result, str):
-        status["n_lines"] = len(result.splitlines())
-        status["n_objects_estimated"] = len(result.splitlines()) // 3
+def _fetch_satcat_metadata(client, norad_ids: list[str], emit=None) -> list[dict]:
+    """Fetch Space-Track SATCAT metadata for the supplied NORAD IDs."""
+    metadata: list[dict] = []
+    batch_size = 500
+    batches = [norad_ids[i:i + batch_size] for i in range(0, len(norad_ids), batch_size)]
+    for b_idx, batch in enumerate(batches):
+        norad_str = ",".join(batch)
+        pct = 76 + int(((b_idx + 1) / max(len(batches), 1)) * 3)
+        url = (
+            "https://www.space-track.org/basicspacedata/query"
+            f"/class/satcat/NORAD_CAT_ID/{norad_str}"
+            "/orderby/NORAD_CAT_ID%20asc/format/json"
+        )
+        try:
+            raw = _decode_response(client._request(url))
+            rows = json.loads(raw) if raw.strip().startswith("[") else []
+            if isinstance(rows, list):
+                metadata.extend(rows)
+            if emit:
+                emit(
+                    f"SATCAT metadata batch {b_idx + 1}/{len(batches)}: +{len(rows) if isinstance(rows, list) else 0} records",
+                    pct,
+                    state="fetching_metadata",
+                    metadata_fetched=len(metadata),
+                    metadata_batches_done=b_idx + 1,
+                    metadata_batches_total=len(batches),
+                )
+        except Exception as e:
+            if emit:
+                emit(
+                    f"SATCAT metadata batch {b_idx + 1}/{len(batches)} failed: {e}",
+                    pct,
+                    state="fetching_metadata",
+                    metadata_fetched=len(metadata),
+                    last_metadata_error=str(e),
+                )
+    return metadata
 
-    Path("data/tle_status.json").write_text(
-        json.dumps(status, indent=2),
-        encoding="utf-8",
-    )
-
-    return status
-
-def load_catalog_status():
-    """
-    Return latest TLE catalog refresh status for the API endpoint:
-    GET /v1/tle/status
-    """
-    import json
-    from pathlib import Path
-
-    status_file = Path("data") / "tle_status.json"
-
-    if not status_file.exists():
-        return {
-            "ok": False,
-            "status": "not_refreshed_yet",
-            "message": "No TLE refresh has been performed yet.",
-        }
-
-    try:
-        return json.loads(status_file.read_text(encoding="utf-8"))
-    except Exception as e:
-        return {
-            "ok": False,
-            "status": "status_read_error",
-            "message": str(e),
-        }
 
 def fetch_and_store(group: str = "starlink", days: int = 30):
     """
-    Refresh the local TLE database using Space-Track gp_history,
-    then ingest results into the same local database used by the existing frontend.
-    Writes live progress to data/refresh_progress.json.
+    Refresh the local TLE database using Space-Track gp / gp_history and enrich
+    object metadata with Space-Track SATCAT.
     """
-    import os
-    import json
-    from datetime import datetime, timezone, timedelta
-    from pathlib import Path
-
     from spacetrack import SpaceTrackSession
-    from tle_database import ingest_tles, get_stats
+    from tle_database import ingest_tles, ingest_object_metadata, get_stats
 
     Path("data").mkdir(exist_ok=True)
-
     started_at = time.time()
     logs = []
     progress_context = {}
 
     def emit(msg, pct=None, state=None, **extra):
-        """
-        Central progress writer.
-
-        Important:
-        - Preserves previous counters such as n_objects, batches_done,
-          batches_total, fetched_tles, expected, ingested.
-        - Allows ingest_tles() to update progress without erasing earlier fields.
-        """
         logs.append(str(msg))
-
         if state is not None:
             progress_context["state"] = state
-
         for key, value in extra.items():
             if value is not None:
                 progress_context[key] = value
-
-        payload_extra = {
-            k: v for k, v in progress_context.items()
-            if k != "state"
-        }
-
+        payload_extra = {k: v for k, v in progress_context.items() if k != "state"}
         _write_refresh_progress(
             state=progress_context.get("state", "running"),
             group=group,
@@ -319,92 +220,52 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
             **payload_extra,
         )
 
-    emit(
-        "Starting TLE refresh.",
-        pct=0,
-        state="starting",
-    )
+    emit("Starting TLE + Space-Track metadata refresh.", pct=0, state="starting")
 
     try:
-        # Ensure compatibility with the existing SpaceTrackSession credential names.
-        # Codespaces may use SPACETRACK_USER / SPACETRACK_PASS while
-        # scripts/spacetrack.py expects SPACETRACK_EMAIL / SPACETRACK_PASSWORD.
         if os.environ.get("SPACETRACK_USER") and not os.environ.get("SPACETRACK_EMAIL"):
             os.environ["SPACETRACK_EMAIL"] = os.environ["SPACETRACK_USER"]
-
         if os.environ.get("SPACETRACK_PASS") and not os.environ.get("SPACETRACK_PASSWORD"):
             os.environ["SPACETRACK_PASSWORD"] = os.environ["SPACETRACK_PASS"]
 
-        all_tles = []
-        source_used = "Space-Track gp_history"
+        all_tles: list[TLEEntry] = []
+        metadata_rows: list[dict] = []
+        source_used = "Space-Track gp_history + satcat"
 
-        def parse_tle_text(raw: str):
-            lines = [line.strip() for line in raw.splitlines() if line.strip()]
-            tles = []
-
-            i = 0
-            while i + 2 < len(lines):
-                name, line1, line2 = lines[i], lines[i + 1], lines[i + 2]
-                if line1.startswith("1 ") and line2.startswith("2 "):
-                    tles.append((name, line1, line2))
-                i += 3
-
-            return tles
-
-        emit(
-            "Opening Space-Track session...",
-            pct=2,
-            state="opening_spacetrack_session",
-        )
-
+        emit("Opening Space-Track session...", pct=2, state="opening_spacetrack_session")
         with SpaceTrackSession() as client:
-            emit(
-                "Space-Track session opened.",
-                pct=4,
-                state="spacetrack_session_opened",
-            )
+            emit("Space-Track session opened.", pct=4, state="spacetrack_session_opened")
             now_dt = datetime.now(timezone.utc)
             end_str = now_dt.strftime("%Y-%m-%d")
             start_hist = (now_dt - timedelta(days=days)).strftime("%Y-%m-%d")
 
-            emit(
-                "Querying Space-Track current LEO catalog...",
-                pct=5,
-                state="fetching_current_catalog",
-            )
-
+            emit("Querying Space-Track current LEO catalog...", pct=5, state="fetching_current_catalog")
             url_list = (
                 "https://www.space-track.org/basicspacedata/query"
                 "/class/gp/EPOCH/%3Enow-2"
                 "/MEAN_MOTION/%3E11.25/ECCENTRICITY/%3C0.25"
-                "/OBJECT_TYPE/payload,debris"
                 "/orderby/NORAD_CAT_ID/format/tle"
             )
-
-            raw_list = client._request(url_list).decode("utf-8", errors="ignore")
-            tles_current = parse_tle_text(raw_list) if raw_list and len(raw_list) > 200 else []
-
+            raw_list = _decode_response(client._request(url_list))
+            tles_current = _parse_tle_text(raw_list) if raw_list and len(raw_list) > 200 else []
             norad_ids = sorted(set(tle[1][2:7].strip() for tle in tles_current))
 
             emit(
-                f"{len(norad_ids)} LEO objects identified.",
+                f"{len(norad_ids)} current LEO objects identified.",
                 pct=15,
                 state="current_catalog_received",
                 n_objects=len(norad_ids),
                 fetched_tles=len(tles_current),
             )
-
             if not norad_ids:
-                raise ValueError("Aucun objet LEO trouvé via Space-Track gp")
-
+                raise ValueError("No LEO object found via Space-Track gp")
             all_tles.extend(tles_current)
 
-            batch_size = 500
-            batches = [
-                norad_ids[i:i + batch_size]
-                for i in range(0, len(norad_ids), batch_size)
-            ]
+            emit("Fetching Space-Track SATCAT metadata...", pct=75, state="fetching_metadata", n_objects=len(norad_ids))
+            metadata_rows = _fetch_satcat_metadata(client, norad_ids, emit=emit)
 
+            batch_size = 500
+            batches = [norad_ids[i:i + batch_size] for i in range(0, len(norad_ids), batch_size)]
             emit(
                 f"{len(batches)} Space-Track history batches to fetch.",
                 pct=20,
@@ -414,25 +275,21 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
                 batches_total=len(batches),
                 fetched_tles=len(all_tles),
             )
-
             for b_idx, batch in enumerate(batches):
                 pct = 20 + int(((b_idx + 1) / max(len(batches), 1)) * 55)
                 norad_str = ",".join(batch)
-
                 url_hist = (
                     "https://www.space-track.org/basicspacedata/query"
                     f"/class/gp_history/NORAD_CAT_ID/{norad_str}"
                     f"/EPOCH/{start_hist}--{end_str}"
                     "/orderby/NORAD_CAT_ID%20asc,EPOCH%20asc/format/tle"
                 )
-
                 try:
-                    raw_h = client._request(url_hist).decode("utf-8", errors="ignore")
-                    batch_tles = parse_tle_text(raw_h) if raw_h and len(raw_h) > 100 else []
+                    raw_h = _decode_response(client._request(url_hist))
+                    batch_tles = _parse_tle_text(raw_h) if raw_h and len(raw_h) > 100 else []
                     all_tles.extend(batch_tles)
-
                     emit(
-                        f"Batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE",
+                        f"History batch {b_idx + 1}/{len(batches)}: +{len(batch_tles)} TLE",
                         pct=pct,
                         state="fetching_history",
                         n_objects=len(norad_ids),
@@ -440,52 +297,31 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
                         batches_total=len(batches),
                         fetched_tles=len(all_tles),
                     )
-
                 except Exception as batch_error:
                     emit(
-                        f"Batch {b_idx + 1}/{len(batches)} failed: {batch_error}",
+                        f"History batch {b_idx + 1}/{len(batches)} failed: {batch_error}",
                         pct=pct,
                         state="fetching_history",
-                        n_objects=len(norad_ids),
-                        batches_done=b_idx + 1,
-                        batches_total=len(batches),
-                        fetched_tles=len(all_tles),
                         last_batch_error=str(batch_error),
                     )
 
-        emit(
-            f"Deduplicating {len(all_tles)} TLE records...",
-            pct=77,
-            state="deduplicating",
-            fetched_tles=len(all_tles),
-        )
-
+        emit(f"Deduplicating {len(all_tles)} TLE records...", pct=77, state="deduplicating", fetched_tles=len(all_tles))
         seen = set()
         unique_tles = []
-
         for tle in all_tles:
             key = tle[1][2:7].strip() + "|" + tle[1][18:32]
             if key not in seen:
                 seen.add(key)
                 unique_tles.append(tle)
-
         all_tles = unique_tles
 
-        emit(
-            f"Ingesting {len(all_tles)} unique TLE records into local database...",
-            pct=80,
-            state="ingesting",
-            fetched_tles=len(all_tles),
-            expected=len(all_tles),
-            ingested=0,
-        )
+        metadata_report = {"upserted": 0, "skipped": 0, "errors": 0, "total": 0}
+        if metadata_rows:
+            emit(f"Ingesting {len(metadata_rows)} SATCAT metadata records...", pct=79, state="ingesting_metadata", metadata_expected=len(metadata_rows))
+            metadata_report = ingest_object_metadata(metadata_rows, source="Space-Track satcat", emit=emit)
 
-        report = ingest_tles(
-            all_tles,
-            source=source_used,
-            emit=emit,
-        )
-
+        emit(f"Ingesting {len(all_tles)} unique TLE records into local database...", pct=80, state="ingesting", fetched_tles=len(all_tles), expected=len(all_tles), ingested=0)
+        report = ingest_tles(all_tles, source=source_used, emit=emit)
         stats = get_stats()
 
         status = {
@@ -495,26 +331,24 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
             "days": days,
             "last_fetched_at": datetime.now(timezone.utc).isoformat(),
             "n_tles_fetched": len(all_tles),
+            "n_metadata_fetched": len(metadata_rows),
+            "metadata_report": metadata_report,
             "report": report,
             "stats": stats,
             "logs_tail": logs[-30:],
         }
-
-        Path("data/tle_status.json").write_text(
-            json.dumps(status, indent=2),
-            encoding="utf-8",
-        )
+        Path("data/tle_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
 
         _write_refresh_progress(
             state="done",
             group=group,
             days=days,
             pct=100,
-            message="TLE refresh completed.",
+            message="TLE + metadata refresh completed.",
             n_objects=progress_context.get("n_objects"),
-            batches_done=progress_context.get("batches_done"),
-            batches_total=progress_context.get("batches_total"),
             fetched_tles=len(all_tles),
+            metadata_fetched=len(metadata_rows),
+            metadata_report=metadata_report,
             ingested=report.get("total", len(all_tles)),
             expected=len(all_tles),
             added=report.get("added"),
@@ -526,177 +360,31 @@ def fetch_and_store(group: str = "starlink", days: int = 30):
             started_at=started_at,
             finished_at=time.time(),
         )
-
         return status
 
     except Exception as e:
         logger.exception("TLE refresh failed")
-
-        payload_extra = {
-            k: v for k, v in progress_context.items()
-            if k != "state"
-        }
-
+        payload_extra = {k: v for k, v in progress_context.items() if k != "state"}
         _write_refresh_progress(
             state="error",
             group=group,
             days=days,
             pct=progress_context.get("pct", 0),
-            message="TLE refresh failed.",
+            message="TLE + metadata refresh failed.",
             error=str(e),
             logs_tail=logs[-10:],
             started_at=started_at,
             finished_at=time.time(),
             **payload_extra,
         )
-
         raise
-
-    # Deduplicate by NORAD + epoch
-    seen = set()
-    unique_tles = []
-
-    for t in all_tles:
-        key = t[1][2:7].strip() + "|" + t[1][18:32]
-        if key not in seen:
-            seen.add(key)
-            unique_tles.append(t)
-
-    all_tles = unique_tles
-
-    emit(f"[INFO] Ingestion de {len(all_tles)} TLE", 80)
-
-    report = ingest_tles(
-        all_tles,
-        source=source_used,
-        emit=emit,
-    )
-
-    _write_refresh_progress(
-        state="done",
-        group=group,
-        days=days,
-        pct=100,
-        message="TLE refresh completed.",
-        ingested=len(all_tles),
-        expected=len(all_tles),
-        report=report,
-        stats=stats,
-        started_at=started_at,
-        finished_at=time.time(),
-    )
-
-    stats = get_stats()
-
-    status = {
-        "ok": True,
-        "group": group,
-        "source": source_used,
-        "days": days,
-        "last_fetched_at": datetime.now(timezone.utc).isoformat(),
-        "n_tles_fetched": len(all_tles),
-        "report": report,
-        "stats": stats,
-        "logs_tail": logs[-30:],
-    }
-
-    Path("data/tle_status.json").write_text(
-        json.dumps(status, indent=2),
-        encoding="utf-8",
-    )
-
-    _write_refresh_progress(
-        state="fetching",
-        group=group,
-        days=days,
-        pct=15,
-        message=f"{len(norad_ids)} LEO objects identified.",
-        n_objects=len(norad_ids),
-        fetched_tles=len(all_tles),
-        started_at=started_at,
-    )
-
-    return status
 
 
 def load_catalog_status():
-    """
-    Return latest TLE database status for GET /v1/tle/status.
-    Prefer real DB stats from tle_database.py.
-    """
-    import json
-    from pathlib import Path
-
+    status_file = Path("data") / "tle_status.json"
+    if not status_file.exists():
+        return {"ok": False, "status": "not_refreshed_yet", "message": "No TLE refresh has been performed yet."}
     try:
-        from tle_database import get_stats
-
-        stats = get_stats()
-
-        status_file = Path("data") / "tle_status.json"
-        last_refresh = None
-        source = None
-
-        if status_file.exists():
-            try:
-                previous = json.loads(status_file.read_text(encoding="utf-8"))
-                last_refresh = previous.get("last_fetched_at")
-                source = previous.get("source")
-            except Exception:
-                pass
-
-        return {
-            "ok": True,
-            "source": source or "local_database",
-            "last_fetched_at": last_refresh or stats.get("last_ingest"),
-            "stats": stats,
-        }
-
+        return json.loads(status_file.read_text(encoding="utf-8"))
     except Exception as e:
-        return {
-            "ok": False,
-            "status": "status_read_error",
-            "message": str(e),
-        }
-
-# src/tle_fetcher.py
-import json, time
-from pathlib import Path
-
-PROGRESS_PATH = Path("data/refresh_progress.json")
-PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-def _write_progress(**kw):
-    payload = {"updated_at": time.time(), **kw}
-    tmp = PROGRESS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload))
-    tmp.replace(PROGRESS_PATH)
-
-def refresh_from_spacetrack_gp_history(group: str = "starlink",
-                                       days: int = 30,
-                                       emit=None) -> dict:
-    started = time.time()
-    _write_progress(state="starting", group=group, ingested=0,
-                    expected=None, started_at=started)
-
-    # 1) fetch
-    _write_progress(state="fetching", group=group, ingested=0,
-                    expected=None, started_at=started,
-                    message="Querying Space-Track gp_history…")
-    records = _fetch_gp_history(group=group, days=days)   # existing logic
-    expected = len(records)
-
-    # 2) ingest in chunks so the count actually moves
-    CHUNK = 500
-    ingested = 0
-    for i in range(0, expected, CHUNK):
-        batch = records[i:i + CHUNK]
-        ingest_tles(batch, source=f"spacetrack:{group}", emit=emit)
-        ingested += len(batch)
-        _write_progress(state="ingesting", group=group,
-                        ingested=ingested, expected=expected,
-                        started_at=started)
-
-    _write_progress(state="done", group=group,
-                    ingested=ingested, expected=expected,
-                    started_at=started, finished_at=time.time())
-    return {"ok": True, "group": group, "ingested": ingested}
+        return {"ok": False, "status": "status_read_error", "message": str(e)}
