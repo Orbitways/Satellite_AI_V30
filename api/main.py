@@ -4,7 +4,7 @@ import sys
 import time
 import math
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,8 +24,14 @@ from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progr
 from tle_database import lookup_tle, get_latest_tles
 from underwriting import run_target_risk_analysis, select_orbital_environment_catalog
 from historical_underwriting import run_historical_target_risk
+from cdm_database import (
+    cdm_status,
+    ingest_cdm_records,
+    parse_cdm_csv,
+    run_historical_cdm_analysis,
+)
 
-app = FastAPI(title="Orbitways Insurer API", version="0.5.1")
+app = FastAPI(title="Orbitways Insurer API", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,9 +112,27 @@ class HistoricalTargetRiskRequest(BaseModel):
     pc_method: Literal["foster", "patera", "montecarlo"] = "foster"
 
 
+class CdmImportRequest(BaseModel):
+    source: str = Field("manual", max_length=128)
+    records: Optional[list[dict[str, Any]]] = None
+    csv_text: Optional[str] = None
+
+
+class HistoricalCdmRequest(BaseModel):
+    target_norad: str = Field(..., min_length=1, max_length=10)
+    lookback_days: float = Field(365, ge=1, le=3650)
+    bucket_days: float = Field(30, ge=1, le=365)
+    time_axis: Literal["tca", "creation_date"] = "tca"
+    cdm_pc_threshold: float = Field(1e-7, gt=0, le=1)
+    cdm_miss_distance_threshold_km: float = Field(5, ge=0.001, le=1000)
+    maneuver_pc_threshold: float = Field(1e-4, gt=0, le=1)
+    maneuver_miss_distance_threshold_km: float = Field(1, ge=0.001, le=1000)
+    max_events: int = Field(200, ge=1, le=2000)
+
+
 @app.get("/")
 def root():
-    return {"service": "Orbitways Insurer API", "version": "0.5.1", "docs": "/docs", "health": "/health"}
+    return {"service": "Orbitways Insurer API", "version": "0.6.0", "docs": "/docs", "health": "/health"}
 
 
 @app.get("/health")
@@ -237,6 +261,56 @@ def underwriting_historical_target_risk(req: HistoricalTargetRiskRequest, author
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"historical target risk replay failed: {e}")
     return {"ok": True, "source": "local_tle_history", "fetched_at": datetime.now(timezone.utc).isoformat(), "elapsed_s": round(time.time() - t0, 2), **result}
+
+
+@app.post("/v1/cdm/import")
+def cdm_import(req: CdmImportRequest, authorization: Optional[str] = Header(None)):
+    _check_auth(authorization)
+    records: list[dict[str, Any]] = []
+    if req.records:
+        records.extend(req.records)
+    if req.csv_text:
+        records.extend(parse_cdm_csv(req.csv_text))
+    if not records:
+        raise HTTPException(status_code=400, detail="Provide either records[] or csv_text containing CDM records")
+    try:
+        report = ingest_cdm_records(records, source=req.source)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CDM import failed: {e}")
+    return report
+
+
+@app.get("/v1/cdm/status")
+def cdm_database_status(authorization: Optional[str] = Header(None)):
+    _check_auth(authorization)
+    try:
+        return cdm_status()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CDM status failed: {e}")
+
+
+@app.post("/v1/underwriting/historical-cdms")
+def underwriting_historical_cdms(req: HistoricalCdmRequest, authorization: Optional[str] = Header(None)):
+    _check_auth(authorization)
+    t0 = time.time()
+    target_norad = (req.target_norad or "").strip()
+    if not target_norad.isdigit():
+        raise HTTPException(status_code=400, detail="target_norad must be numeric")
+    try:
+        result = run_historical_cdm_analysis(
+            target_norad=target_norad,
+            lookback_days=req.lookback_days,
+            bucket_days=req.bucket_days,
+            time_axis=req.time_axis,
+            cdm_pc_threshold=req.cdm_pc_threshold,
+            cdm_miss_distance_threshold_km=req.cdm_miss_distance_threshold_km,
+            maneuver_pc_threshold=req.maneuver_pc_threshold,
+            maneuver_miss_distance_threshold_km=req.maneuver_miss_distance_threshold_km,
+            max_events=req.max_events,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"historical CDM analysis failed: {e}")
+    return {"ok": True, "source": "imported_cdm_records", "fetched_at": datetime.now(timezone.utc).isoformat(), "elapsed_s": round(time.time() - t0, 2), **result}
 
 
 @app.post("/v1/tle/refresh")
