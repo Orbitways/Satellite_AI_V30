@@ -4,10 +4,9 @@ underwriting.py — Target-centric underwriting KPIs for one satellite.
 Given one target satellite, estimate baseline forward-looking underwriting KPIs
 from a target-vs-catalog SGP4 propagation.
 
-The catalog used for propagation is no longer meant to be an arbitrary "first N
-objects" list. The API can preselect a physically relevant orbital environment
-around the target, then this module propagates that selected candidate set and
-reports its composition.
+Catalog selection is based on the target orbital environment. Object classes use
+Space-Track/SATCAT metadata when available and fall back to name heuristics only
+when metadata is missing.
 """
 
 import math
@@ -26,9 +25,10 @@ from conjunction import (
     _eci_to_geo,
 )
 
-
 MAX_PROPAGATION_STEPS = 500
 OBJECT_CLASSES = ("debris", "inactive_satellite", "active_satellite")
+ACTIVE_OPS_STATUS = {"+", "P", "B", "S", "X"}
+INACTIVE_OPS_STATUS = {"-", "D"}
 
 
 def _safe_float(value, default=None):
@@ -44,25 +44,69 @@ def _record_key(row: dict) -> str:
     return f"{row.get('name', 'UNKNOWN')} [{row.get('norad_id', 'NA')}]"
 
 
-def classify_object(name: Optional[str]) -> str:
-    """
-    Best-effort class split for the insurer UI.
+def _clean(value) -> str:
+    return str(value or "").strip()
 
-    This is intentionally conservative in the metadata claim. Debris and rocket
-    bodies are commonly visible in object names. True active/inactive payload
-    status requires authoritative catalog metadata and should replace this
-    heuristic when available.
+
+def classify_object(row_or_name) -> tuple[str, str]:
     """
-    n = (name or "").upper()
+    Return (class, method).
+
+    Preferred source is Space-Track/SATCAT metadata joined by tle_database.py:
+    - OBJECT_TYPE = DEBRIS -> debris
+    - OBJECT_TYPE = ROCKET BODY -> inactive_satellite
+    - OBJECT_TYPE = PAYLOAD -> active/inactive payload depending on DECAY and
+      OPS_STATUS_CODE when available
+
+    Fallback is a name heuristic. This fallback remains useful for pre-existing
+    databases that have not yet been refreshed with SATCAT metadata.
+    """
+    if isinstance(row_or_name, dict):
+        row = row_or_name
+        object_type = _clean(row.get("object_type")).upper()
+        decay_date = _clean(row.get("decay_date"))
+        ops_status = _clean(row.get("ops_status_code")).upper()
+
+        if object_type:
+            if "DEBRIS" in object_type:
+                return "debris", "spacetrack_satcat_object_type"
+            if "ROCKET" in object_type or "R/B" in object_type:
+                return "inactive_satellite", "spacetrack_satcat_object_type"
+            if "PAYLOAD" in object_type:
+                if decay_date:
+                    return "inactive_satellite", "spacetrack_satcat_payload_decay"
+                if ops_status in INACTIVE_OPS_STATUS:
+                    return "inactive_satellite", "spacetrack_satcat_ops_status"
+                if ops_status in ACTIVE_OPS_STATUS:
+                    return "active_satellite", "spacetrack_satcat_ops_status"
+                # If Space-Track confirms PAYLOAD and there is no decay/status
+                # evidence of inactivity, classify as active for screening.
+                return "active_satellite", "spacetrack_satcat_payload_no_decay"
+
+        name = row.get("meta_object_name") or row.get("name") or row.get("object_name")
+    else:
+        name = row_or_name
+
+    n = _clean(name).upper()
     if "DEB" in n or "DEBRIS" in n:
-        return "debris"
+        return "debris", "name_heuristic"
     if "R/B" in n or "ROCKET" in n or "OBJECT" in n:
-        return "inactive_satellite"
-    return "active_satellite"
+        return "inactive_satellite", "name_heuristic"
+    return "active_satellite", "name_heuristic"
 
 
 def _empty_class_counts():
     return {cls: 0 for cls in OBJECT_CLASSES}
+
+
+def _empty_method_counts():
+    return {
+        "spacetrack_satcat_object_type": 0,
+        "spacetrack_satcat_payload_decay": 0,
+        "spacetrack_satcat_ops_status": 0,
+        "spacetrack_satcat_payload_no_decay": 0,
+        "name_heuristic": 0,
+    }
 
 
 def _class_allowed(object_class: str, include_debris: bool, include_inactive_satellites: bool, include_active_satellites: bool) -> bool:
@@ -84,13 +128,7 @@ def select_orbital_environment_catalog(
     include_crossing_orbits: bool = True,
     max_selected_objects: Optional[int] = None,
 ) -> tuple[list, dict]:
-    """
-    Build the physically relevant candidate catalog around a target.
-
-    Current implementation uses available database fields: altitude, inclination,
-    eccentricity proxy, mean motion and object name. It is a pre-filter: the true
-    dynamic risk is still computed by propagation after this selection.
-    """
+    """Build the physically relevant candidate catalog around a target."""
     target_norad = str(target_record.get("norad_id", "")).strip()
     target_alt = _safe_float(target_record.get("alt_km"))
     target_inc = _safe_float(target_record.get("inc"))
@@ -98,6 +136,9 @@ def select_orbital_environment_catalog(
     selected = []
     total_by_class = _empty_class_counts()
     selected_by_class = _empty_class_counts()
+    classification_methods = _empty_method_counts()
+    selected_classification_methods = _empty_method_counts()
+    metadata_rows_available = 0
     rejected = {
         "target_object": 0,
         "missing_tle": 0,
@@ -116,8 +157,12 @@ def select_orbital_environment_catalog(
             rejected["missing_tle"] += 1
             continue
 
-        obj_class = classify_object(row.get("name"))
+        if row.get("object_type") or row.get("meta_object_name") or row.get("metadata_source"):
+            metadata_rows_available += 1
+
+        obj_class, class_method = classify_object(row)
         total_by_class[obj_class] = total_by_class.get(obj_class, 0) + 1
+        classification_methods[class_method] = classification_methods.get(class_method, 0) + 1
 
         if not _class_allowed(obj_class, include_debris, include_inactive_satellites, include_active_satellites):
             rejected["object_class_excluded"] += 1
@@ -131,16 +176,12 @@ def select_orbital_environment_catalog(
         if altitude_band_km is not None and target_alt is not None and row_alt is not None:
             alt_delta = abs(row_alt - target_alt)
             if alt_delta > float(altitude_band_km):
-                # Crossing-orbit support: if eccentricity is available and high-ish,
-                # keep a wider gate because mean altitude alone can be misleading.
                 ecc = _safe_float(row.get("ecc"), 0.0) or 0.0
                 if not include_crossing_orbits or ecc < 0.01 or alt_delta > float(altitude_band_km) * 2.0:
                     alt_ok = False
 
         if inclination_band_deg is not None and target_inc is not None and row_inc is not None:
             inc_delta = abs(row_inc - target_inc)
-            # Retrograde/prograde wrap is not usually needed for LEO, but keep the
-            # smaller angular distance for robustness.
             inc_delta = min(inc_delta, 180.0 - inc_delta)
             if inc_delta > float(inclination_band_deg):
                 inc_ok = False
@@ -154,8 +195,10 @@ def select_orbital_environment_catalog(
 
         enriched = dict(row)
         enriched["object_class"] = obj_class
+        enriched["object_class_method"] = class_method
         selected.append(enriched)
         selected_by_class[obj_class] = selected_by_class.get(obj_class, 0) + 1
+        selected_classification_methods[class_method] = selected_classification_methods.get(class_method, 0) + 1
 
         if max_selected_objects is not None and len(selected) >= int(max_selected_objects):
             rejected["safety_cap_reached"] += 1
@@ -174,11 +217,14 @@ def select_orbital_environment_catalog(
             "active_satellite": bool(include_active_satellites),
         },
         "catalog_records_received": len(catalog_records),
+        "metadata_rows_available": metadata_rows_available,
         "candidate_objects_selected": len(selected),
         "objects_by_class_in_received_catalog": total_by_class,
         "selected_objects_by_class": selected_by_class,
+        "classification_methods": classification_methods,
+        "selected_classification_methods": selected_classification_methods,
         "rejected_counts": rejected,
-        "classification_method": "heuristic_from_object_name; replace with authoritative catalog metadata when available",
+        "classification_method": "Space-Track/SATCAT metadata when available; name heuristic fallback only for objects without metadata",
     }
     return selected, report
 
@@ -236,7 +282,6 @@ def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
 def _confidence(target_record: dict, catalog_count: int, effective_days: float, requested_days: float, pc_method: str) -> dict:
     score = 45
     drivers = []
-
     target_epoch = _parse_datetime(target_record.get("epoch"))
     if target_epoch:
         age_days = abs((datetime.now(timezone.utc) - target_epoch).total_seconds()) / 86400
@@ -293,6 +338,19 @@ def _confidence(target_record: dict, catalog_count: int, effective_days: float, 
     return {"score": score, "drivers": drivers}
 
 
+def _metadata_payload(row: dict) -> dict:
+    return {
+        "object_type": row.get("object_type"),
+        "rcs_size": row.get("rcs_size"),
+        "country": row.get("country"),
+        "launch_date": row.get("launch_date"),
+        "decay_date": row.get("decay_date"),
+        "ops_status_code": row.get("ops_status_code"),
+        "metadata_source": row.get("metadata_source"),
+        "metadata_updated_at": row.get("metadata_updated_at"),
+    }
+
+
 def run_target_risk_analysis(
     target_record: dict,
     catalog_records: list,
@@ -320,6 +378,7 @@ def run_target_risk_analysis(
     records_by_key = {target_key: target_record}
     tles = [(target_key, target_record["tle1"], target_record["tle2"])]
     catalog_composition = _empty_class_counts()
+    catalog_class_methods = _empty_method_counts()
 
     for row in catalog_records:
         norad = str(row.get("norad_id", "")).strip()
@@ -331,8 +390,11 @@ def run_target_risk_analysis(
         if key in records_by_key:
             continue
         enriched = dict(row)
-        enriched["object_class"] = enriched.get("object_class") or classify_object(enriched.get("name"))
+        cls, method = classify_object(enriched)
+        enriched["object_class"] = enriched.get("object_class") or cls
+        enriched["object_class_method"] = enriched.get("object_class_method") or method
         catalog_composition[enriched["object_class"]] = catalog_composition.get(enriched["object_class"], 0) + 1
+        catalog_class_methods[enriched["object_class_method"]] = catalog_class_methods.get(enriched["object_class_method"], 0) + 1
         records_by_key[key] = enriched
         tles.append((key, enriched["tle1"], enriched["tle2"]))
 
@@ -340,7 +402,6 @@ def run_target_risk_analysis(
         raise ValueError("not enough catalog objects to run target risk analysis")
 
     states = propagate_all(tles, hours=requested_hours, step_min=step_min, pert_flags=None, emit=None)
-
     target_state = states.get(target_key)
     if not target_state:
         raise ValueError(f"target propagation failed for NORAD {target_norad}")
@@ -352,10 +413,7 @@ def run_target_risk_analysis(
     actual_effective_days = max(0.0, ((actual_steps - 1) * float(step_min)) / (60.0 * 24.0))
 
     events = []
-    event_counts_by_class = {
-        cls: {"conjunction": 0, "cdm": 0, "maneuver": 0}
-        for cls in OBJECT_CLASSES
-    }
+    event_counts_by_class = {cls: {"conjunction": 0, "cdm": 0, "maneuver": 0} for cls in OBJECT_CLASSES}
 
     for key, state in states.items():
         if key == target_key:
@@ -366,16 +424,15 @@ def run_target_risk_analysis(
         if n <= 0:
             continue
 
-        deltas = pos[:n] - target_pos[:n]
-        distances = np.linalg.norm(deltas, axis=1)
+        distances = np.linalg.norm(pos[:n] - target_pos[:n], axis=1)
         t_idx = int(np.argmin(distances))
         miss_km = float(distances[t_idx])
-
         if miss_km > screening_miss_distance_threshold_km:
             continue
 
         secondary_record = records_by_key.get(key, {})
-        object_class = secondary_record.get("object_class") or classify_object(secondary_record.get("name"))
+        object_class = secondary_record.get("object_class") or classify_object(secondary_record)[0]
+        class_method = secondary_record.get("object_class_method") or classify_object(secondary_record)[1]
         orbit_class = target_state.get("orbit_class") or state.get("orbit_class") or target_record.get("orbit_class")
         sigma = _combined_sigma_km(orbit_class)
         r_hard = _hard_body_radius_km(target_key, key)
@@ -398,8 +455,10 @@ def run_target_risk_analysis(
             "target_norad": target_norad,
             "target_name": target_record.get("name"),
             "secondary_norad": str(state.get("norad", secondary_record.get("norad_id", ""))),
-            "secondary_name": secondary_record.get("name", key),
+            "secondary_name": secondary_record.get("meta_object_name") or secondary_record.get("name", key),
             "secondary_object_class": object_class,
+            "secondary_object_class_method": class_method,
+            "secondary_metadata": _metadata_payload(secondary_record),
             "t_ca": t_ca.isoformat(),
             "t_ca_h": round((t_ca - times[0]).total_seconds() / 3600.0, 2),
             "miss_dist_km": round(miss_km, 4),
@@ -427,6 +486,7 @@ def run_target_risk_analysis(
         "propagated_objects": max(0, len(states) - 1),
         "excluded_target_norad": target_norad,
         "selected_objects_by_class": catalog_composition,
+        "selected_classification_methods": catalog_class_methods,
     }
     if environment_selection:
         catalog_payload["environment_selection"] = environment_selection
@@ -434,12 +494,13 @@ def run_target_risk_analysis(
     return {
         "target": {
             "norad_id": target_norad,
-            "name": target_record.get("name"),
+            "name": target_record.get("meta_object_name") or target_record.get("name"),
             "epoch": target_record.get("epoch"),
             "orbit_class": target_record.get("orbit_class"),
             "alt_km": _safe_float(target_record.get("alt_km")),
             "inc": _safe_float(target_record.get("inc")),
             "source": target_record.get("source"),
+            "metadata": _metadata_payload(target_record),
         },
         "analysis_window": {
             "requested_days": float(horizon_days),
@@ -463,21 +524,9 @@ def run_target_risk_analysis(
         },
         "classification_counts_by_object_class": event_counts_by_class,
         "kpis": {
-            "conjunction_events": {
-                "period_count": conjunction_count,
-                "annualized_rate": _annualized_rate(conjunction_count, actual_effective_days),
-                "definition": "unique secondary objects whose closest approach to the target is within the screening miss-distance threshold",
-            },
-            "cdm_equivalent_alerts": {
-                "period_count": cdm_count,
-                "annualized_rate": _annualized_rate(cdm_count, actual_effective_days),
-                "definition": "screened events exceeding the CDM-equivalent Pc threshold or CDM-equivalent miss-distance threshold",
-            },
-            "avoidance_maneuvers": {
-                "period_count": maneuver_count,
-                "annualized_rate": _annualized_rate(maneuver_count, actual_effective_days),
-                "definition": "screened events exceeding the maneuver Pc threshold or maneuver miss-distance threshold",
-            },
+            "conjunction_events": {"period_count": conjunction_count, "annualized_rate": _annualized_rate(conjunction_count, actual_effective_days), "definition": "unique secondary objects whose closest approach to the target is within the screening miss-distance threshold"},
+            "cdm_equivalent_alerts": {"period_count": cdm_count, "annualized_rate": _annualized_rate(cdm_count, actual_effective_days), "definition": "screened events exceeding the CDM-equivalent Pc threshold or CDM-equivalent miss-distance threshold"},
+            "avoidance_maneuvers": {"period_count": maneuver_count, "annualized_rate": _annualized_rate(maneuver_count, actual_effective_days), "definition": "screened events exceeding the maneuver Pc threshold or maneuver miss-distance threshold"},
             "max_pc": max_pc,
             "max_pc_str": f"{max_pc:.2e}",
             "min_miss_distance_km": min_miss,
@@ -487,6 +536,7 @@ def run_target_risk_analysis(
         "methodology": {
             "model": "target-vs-environment-catalog SGP4 propagation from local TLE database",
             "catalog_selection": "physical orbital-environment prefilter around target, followed by SGP4 propagation",
+            "object_classification": "Space-Track/SATCAT metadata when available; name heuristic fallback for missing metadata",
             "event_grouping": "one closest-approach event per secondary object over the analysis window",
             "annualization": "period_count * 365.25 / effective_days",
             "baseline_only": True,
@@ -495,7 +545,7 @@ def run_target_risk_analysis(
             "TLE-only propagation; no operator ephemerides or covariance messages ingested yet.",
             "Pc uses simplified isotropic covariance proxies derived from orbit class.",
             "Future CDM counts are threshold-derived CDM-equivalent indicators, not official 18 SDS CDM messages.",
-            "Object class split is currently heuristic from object names until authoritative catalog metadata is stored.",
+            "Active/inactive payload status uses Space-Track DECAY and OPS_STATUS_CODE when available; payload status can remain uncertain for some objects.",
             "No ARGO risk-reduction effect is applied in this baseline endpoint.",
         ],
     }
