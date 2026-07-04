@@ -24,14 +24,10 @@ from tle_fetcher import fetch_and_store, load_catalog_status, load_refresh_progr
 from tle_database import lookup_tle, get_latest_tles
 from underwriting import run_target_risk_analysis, select_orbital_environment_catalog
 from historical_underwriting import run_historical_target_risk
-from cdm_database import (
-    cdm_status,
-    ingest_cdm_records,
-    parse_cdm_csv,
-    run_historical_cdm_analysis,
-)
+from cdm_database import cdm_status, ingest_cdm_records, parse_cdm_csv, run_historical_cdm_analysis
+from cdm_spacetrack import fetch_spacetrack_public_cdms
 
-app = FastAPI(title="Orbitways Insurer API", version="0.6.0")
+app = FastAPI(title="Orbitways Insurer API", version="0.6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,14 +77,12 @@ class TargetRiskRequest(BaseModel):
     maneuver_pc_threshold: float = Field(1e-4, gt=0, le=1)
     maneuver_miss_distance_threshold_km: float = Field(1, ge=0.01, le=100)
     catalog_orbit_class: Optional[str] = Field("LEO", max_length=8)
-
     altitude_band_km: Optional[float] = Field(300, ge=10, le=5000)
     inclination_band_deg: Optional[float] = Field(20, ge=0, le=180)
     include_debris: bool = True
     include_inactive_satellites: bool = True
     include_active_satellites: bool = True
     include_crossing_orbits: bool = True
-
     max_catalog_objects: int = Field(30000, ge=100, le=50000)
     max_events: int = Field(50, ge=1, le=500)
     pc_method: Literal["foster", "patera", "montecarlo"] = "foster"
@@ -118,6 +112,12 @@ class CdmImportRequest(BaseModel):
     csv_text: Optional[str] = None
 
 
+class CdmSpaceTrackSyncRequest(BaseModel):
+    target_norad: str = Field(..., min_length=1, max_length=10)
+    lookback_days: int = Field(365, ge=1, le=3650)
+    max_records: int = Field(10000, ge=1, le=50000)
+
+
 class HistoricalCdmRequest(BaseModel):
     target_norad: str = Field(..., min_length=1, max_length=10)
     lookback_days: float = Field(365, ge=1, le=3650)
@@ -132,7 +132,7 @@ class HistoricalCdmRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "Orbitways Insurer API", "version": "0.6.0", "docs": "/docs", "health": "/health"}
+    return {"service": "Orbitways Insurer API", "version": "0.6.1", "docs": "/docs", "health": "/health"}
 
 
 @app.get("/health")
@@ -156,7 +156,6 @@ def assessments(req: AssessmentRequest, authorization: Optional[str] = Header(No
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"analysis failed: {e}")
-
     max_pc = max((c.get("Pc", 0.0) for c in conjunctions), default=0.0)
     source = "spacetrack" if os.environ.get("SPACETRACK_EMAIL") or os.environ.get("SPACETRACK_USER") else "celestrak"
     sat_a = {c.get("sat_A") for c in conjunctions if c.get("sat_A")}
@@ -171,23 +170,19 @@ def underwriting_target_risk(req: TargetRiskRequest, authorization: Optional[str
     target_norad = (req.target_norad or "").strip()
     if not target_norad.isdigit():
         raise HTTPException(status_code=400, detail="target_norad must be numeric")
-
     catalog_orbit_class = _parse_catalog_orbit_class(req.catalog_orbit_class)
-
     try:
         target_matches = lookup_tle(q=target_norad, limit=1)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"target TLE lookup failed: {e}")
     if not target_matches:
         raise HTTPException(status_code=404, detail=f"No TLE found for target NORAD ID {target_norad}. Refresh the TLE database first.")
-
     try:
         raw_catalog_records = get_latest_tles(limit=req.max_catalog_objects, orbit_class=catalog_orbit_class)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"catalog TLE lookup failed: {e}")
     if not raw_catalog_records:
         raise HTTPException(status_code=404, detail="No catalog TLE records available. Refresh the TLE database first.")
-
     try:
         selected_catalog_records, environment_report = select_orbital_environment_catalog(
             target_record=target_matches[0],
@@ -202,10 +197,8 @@ def underwriting_target_risk(req: TargetRiskRequest, authorization: Optional[str
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"orbital environment selection failed: {e}")
-
     if not selected_catalog_records:
         raise HTTPException(status_code=404, detail="No candidate objects found in the selected orbital environment. Widen altitude/inclination bands or include more object classes.")
-
     try:
         result = run_target_risk_analysis(
             target_record=target_matches[0],
@@ -223,11 +216,9 @@ def underwriting_target_risk(req: TargetRiskRequest, authorization: Optional[str
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"target risk analysis failed: {e}")
-
     result["catalog"]["orbit_class_filter"] = catalog_orbit_class or "ALL"
     result["catalog"]["catalog_compute_cap"] = req.max_catalog_objects
     result["catalog"]["note"] = "Catalog selection is based on the target orbital environment. catalog_compute_cap is an internal performance cap, not a risk-model input."
-
     return {"ok": True, "source": "local_tle_database", "fetched_at": datetime.now(timezone.utc).isoformat(), "elapsed_s": round(time.time() - t0, 2), **result}
 
 
@@ -238,7 +229,6 @@ def underwriting_historical_target_risk(req: HistoricalTargetRiskRequest, author
     target_norad = (req.target_norad or "").strip()
     if not target_norad.isdigit():
         raise HTTPException(status_code=400, detail="target_norad must be numeric")
-
     catalog_orbit_class = _parse_catalog_orbit_class(req.catalog_orbit_class)
     try:
         result = run_historical_target_risk(
@@ -287,6 +277,22 @@ def cdm_database_status(authorization: Optional[str] = Header(None)):
         return cdm_status()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CDM status failed: {e}")
+
+
+@app.post("/v1/cdm/sync/spacetrack")
+def cdm_sync_spacetrack(req: CdmSpaceTrackSyncRequest, authorization: Optional[str] = Header(None)):
+    _check_auth(authorization)
+    target_norad = (req.target_norad or "").strip()
+    if not target_norad.isdigit():
+        raise HTTPException(status_code=400, detail="target_norad must be numeric")
+    try:
+        return fetch_spacetrack_public_cdms(
+            target_norad=target_norad,
+            lookback_days=req.lookback_days,
+            max_records=req.max_records,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Space-Track CDM sync failed: {e}")
 
 
 @app.post("/v1/underwriting/historical-cdms")
@@ -377,19 +383,9 @@ def _clean(value):
 
 
 def _scene_object_type(row: dict) -> tuple[str, str]:
-    """
-    Return a UI-oriented scene object type and classification source.
-
-    Values intentionally match the frontend legend:
-    - payload_active
-    - payload_inactive
-    - debris
-    - rocket_body
-    """
     object_type = _clean(row.get("object_type")).upper()
     decay_date = _clean(row.get("decay_date"))
     ops_status = _clean(row.get("ops_status_code")).upper()
-
     if object_type:
         if "DEBRIS" in object_type:
             return "debris", "spacetrack_satcat_object_type"
@@ -399,7 +395,6 @@ def _scene_object_type(row: dict) -> tuple[str, str]:
             if decay_date or ops_status in {"-", "D"}:
                 return "payload_inactive", "spacetrack_satcat_payload_status"
             return "payload_active", "spacetrack_satcat_payload_status"
-
     name = _clean(row.get("meta_object_name") or row.get("name") or row.get("object_name")).upper()
     if "DEB" in name or "DEBRIS" in name:
         return "debris", "name_heuristic"
@@ -424,12 +419,7 @@ def _scene_metadata(row: dict):
 
 
 def _empty_scene_type_counts():
-    return {
-        "payload_active": 0,
-        "payload_inactive": 0,
-        "debris": 0,
-        "rocket_body": 0,
-    }
+    return {"payload_active": 0, "payload_inactive": 0, "debris": 0, "rocket_body": 0}
 
 
 @app.get("/v1/leo/scene")
@@ -451,7 +441,6 @@ def leo_scene(selected_norad: Optional[str] = None, max_objects: int = 30000):
                 selected_error = f"No TLE found for NORAD ID {selected_norad}"
         if not records:
             raise HTTPException(status_code=404, detail="No LEO TLE records available. Refresh the TLE database first.")
-
         keyed_records = []
         seen_keys = set()
         for row in records:
@@ -460,16 +449,13 @@ def leo_scene(selected_norad: Optional[str] = None, max_objects: int = 30000):
                 continue
             seen_keys.add(key)
             keyed_records.append((key, row))
-
         cloud_tles = [(key, row["tle1"], row["tle2"]) for key, row in keyed_records]
         state_epoch_unix = time.time()
         cloud_states = propagate_all(cloud_tles, hours=0.001, step_min=1.0, pert_flags=None, emit=None)
-
         objects = []
         object_type_counts = _empty_scene_type_counts()
         classification_method_counts = {}
         metadata_available = 0
-
         for key, row in keyed_records:
             state = cloud_states.get(key)
             if not state:
@@ -482,19 +468,7 @@ def leo_scene(selected_norad: Optional[str] = None, max_objects: int = 30000):
             classification_method_counts[object_type_source] = classification_method_counts.get(object_type_source, 0) + 1
             if row.get("object_type") or row.get("metadata_source"):
                 metadata_available += 1
-
-            objects.append({
-                "norad_id": str(row["norad_id"]),
-                "name": row.get("meta_object_name") or row["name"],
-                "object_type": object_type,
-                "object_type_source": object_type_source,
-                "metadata": _scene_metadata(row),
-                "orbit_class": row.get("orbit_class") or state.get("orbit_class"),
-                "alt_km": alt_now,
-                "position_km": _vec3(pos0),
-                "velocity_km_s": _vec3(vel0),
-            })
-
+            objects.append({"norad_id": str(row["norad_id"]), "name": row.get("meta_object_name") or row["name"], "object_type": object_type, "object_type_source": object_type_source, "metadata": _scene_metadata(row), "orbit_class": row.get("orbit_class") or state.get("orbit_class"), "alt_km": alt_now, "position_km": _vec3(pos0), "velocity_km_s": _vec3(vel0)})
         selected_payload = None
         if selected_record:
             selected_key = _scene_key(selected_record)
@@ -504,53 +478,10 @@ def leo_scene(selected_norad: Optional[str] = None, max_objects: int = 30000):
                 pos0 = selected_state["pos_km"][0]
                 vel0 = selected_state["vel_km_s"][0]
                 object_type, object_type_source = _scene_object_type(selected_record)
-                selected_payload = {
-                    "norad_id": str(selected_record["norad_id"]),
-                    "name": selected_record.get("meta_object_name") or selected_record["name"],
-                    "object_type": object_type,
-                    "object_type_source": object_type_source,
-                    "metadata": _scene_metadata(selected_record),
-                    "tle1": selected_record["tle1"],
-                    "tle2": selected_record["tle2"],
-                    "epoch": selected_record.get("epoch"),
-                    "orbit_class": selected_record.get("orbit_class") or selected_state.get("orbit_class"),
-                    "alt_km": round(_norm_km(pos0) - RE_KM, 1),
-                    "catalog_alt_km": _float_or_none(selected_record.get("alt_km")),
-                    "inc": _float_or_none(selected_record.get("inc")),
-                    "ecc": _float_or_none(selected_record.get("ecc")),
-                    "mm": _float_or_none(selected_record.get("mm")),
-                    "period_min": _period_min_from_mean_motion(selected_record.get("mm")),
-                    "current_position_km": _vec3(pos0),
-                    "current_velocity_km_s": _vec3(vel0),
-                    "state_epoch_unix": state_epoch_unix,
-                    "orbit_points_km": [_vec3(point) for point in selected_state["pos_km"]],
-                }
+                selected_payload = {"norad_id": str(selected_record["norad_id"]), "name": selected_record.get("meta_object_name") or selected_record["name"], "object_type": object_type, "object_type_source": object_type_source, "metadata": _scene_metadata(selected_record), "tle1": selected_record["tle1"], "tle2": selected_record["tle2"], "epoch": selected_record.get("epoch"), "orbit_class": selected_record.get("orbit_class") or selected_state.get("orbit_class"), "alt_km": round(_norm_km(pos0) - RE_KM, 1), "catalog_alt_km": _float_or_none(selected_record.get("alt_km")), "inc": _float_or_none(selected_record.get("inc")), "ecc": _float_or_none(selected_record.get("ecc")), "mm": _float_or_none(selected_record.get("mm")), "period_min": _period_min_from_mean_motion(selected_record.get("mm")), "current_position_km": _vec3(pos0), "current_velocity_km_s": _vec3(vel0), "state_epoch_unix": state_epoch_unix, "orbit_points_km": [_vec3(point) for point in selected_state["pos_km"]]}
             else:
                 selected_error = f"Propagation failed for NORAD ID {selected_norad}"
-
-        return {
-            "ok": True,
-            "server_time_utc": datetime.now(timezone.utc).isoformat(),
-            "state_epoch_unix": state_epoch_unix,
-            "frame": "ECI",
-            "earth_radius_km": RE_KM,
-            "total_objects": len(records),
-            "rendered_objects": len(objects),
-            "metadata_available_objects": metadata_available,
-            "object_type_counts": object_type_counts,
-            "classification_method_counts": classification_method_counts,
-            "classification_method": "Space-Track/SATCAT metadata when available; name heuristic fallback for objects without metadata",
-            "objects": objects,
-            "selected": selected_payload,
-            "selected_error": selected_error,
-            "motion": {
-                "model": "linear_velocity_interpolation_between_backend_sgp4_snapshots",
-                "velocity_units": "km/s",
-                "position_units": "km",
-                "recommended_refresh_s": 10,
-                "max_client_interpolation_s": 30,
-            },
-        }
+        return {"ok": True, "server_time_utc": datetime.now(timezone.utc).isoformat(), "state_epoch_unix": state_epoch_unix, "frame": "ECI", "earth_radius_km": RE_KM, "total_objects": len(records), "rendered_objects": len(objects), "metadata_available_objects": metadata_available, "object_type_counts": object_type_counts, "classification_method_counts": classification_method_counts, "classification_method": "Space-Track/SATCAT metadata when available; name heuristic fallback for objects without metadata", "objects": objects, "selected": selected_payload, "selected_error": selected_error, "motion": {"model": "linear_velocity_interpolation_between_backend_sgp4_snapshots", "velocity_units": "km/s", "position_units": "km", "recommended_refresh_s": 10, "max_client_interpolation_s": 30}}
     except HTTPException:
         raise
     except Exception as e:
