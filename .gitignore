@@ -1,4 +1,3 @@
-
 # Runtime / generated data
 data/*.sqlite
 data/*.sqlite-*
@@ -6,39 +5,16 @@ data/refresh_progress.json
 data/tle_status.json
 data/spacetrack_cache/
 data/tle_database/
-.env
-__pycache__/
-*.pyc
+deploy/persistent/
+deploy/.env
+backups/
 
-# Runtime / generated data
-data/*.sqlite
-data/*.sqlite-*
-data/refresh_progress.json
-data/tle_status.json
-data/spacetrack_cache/
-data/tle_database/
+# Local configuration
 .env
-__pycache__/
-*.pyc
 
-# Runtime / generated data
-data/*.sqlite
-data/*.sqlite-*
-data/refresh_progress.json
-data/tle_status.json
-data/spacetrack_cache/
-data/tle_database/
-.env
+# Python
 __pycache__/
 *.pyc
-
-# Runtime / generated data
-data/*.sqlite
-data/*.sqlite-*
-data/refresh_progress.json
-data/tle_status.json
-data/spacetrack_cache/
-data/tle_database/
-.env
-__pycache__/
-*.pyc
+.pytest_cache/
+.venv/
+venv/
