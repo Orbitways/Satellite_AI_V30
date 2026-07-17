@@ -1,6 +1,6 @@
 # Automatic Space-Track CDM archive
 
-The backend can now run a separate worker that retrieves every `cdm_public`
+The backend includes a durable collector that retrieves every `cdm_public`
 record visible to the configured Space-Track account and stores it in the
 existing SQLite `cdm_records` table.
 
@@ -14,6 +14,8 @@ existing SQLite `cdm_records` table.
 - Durable scheduler state is stored in `cdm_sync_state`.
 - A SQLite lease prevents duplicate downloads when two workers start.
 - After a restart, the worker resumes from its persisted checkpoint.
+- The production provider maps the public `CREATED`, `MIN_RNG`, `PC`,
+  `SAT_1_ID` and `SAT_2_ID` fields while retaining the complete raw response.
 
 Space-Track only returns CDMs that the account is entitled to access. Empty
 results must therefore not be interpreted as zero conjunction risk.
@@ -37,23 +39,13 @@ export CDM_SYNC_MAX_LOOKBACK_DAYS=30
 export CDM_SYNC_MAX_RECORDS=50000
 ```
 
-## Start API and worker together
+## Local or Codespaces operation
 
 From the repository root:
 
 ```bash
 bash scripts/start_backend_with_cdm_sync.sh
 ```
-
-The default API command is equivalent to:
-
-```bash
-uvicorn api.main:app --host 0.0.0.0 --port 8001
-```
-
-Override `HOST`, `PORT`, or `UVICORN_APP` when required.
-
-## Manual operations
 
 Run one synchronization immediately:
 
@@ -67,10 +59,12 @@ Show the durable scheduler history and CDM database status:
 bash scripts/run_cdm_auto_sync.sh --status
 ```
 
-## Important deployment limitation
+## Always-on production operation
 
-The worker only runs while the backend host is awake. A GitHub Codespace that
-is stopped or suspended cannot execute an 8-hour job. The worker catches up on
-restart within Space-Track's available lookback window, but uninterrupted
-collection requires an always-on host or an external scheduler running the
-one-shot worker against a persistent database volume.
+Use the Docker VPS deployment under `deploy/`. It provides persistent host
+storage, automatic HTTPS, restart policies, health checks and daily SQLite
+backups. See `deploy/README.md` for the exact installation commands.
+
+A GitHub Codespace is not a production host: when it stops or times out, all
+running processes stop. Uninterrupted collection requires an always-on VPS or
+another persistent server.
