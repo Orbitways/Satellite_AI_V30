@@ -14,6 +14,8 @@ import socket
 import threading
 import uuid
 
+import cdm_auto_sync
+from cdm_archive_provider import fetch_available_cdms
 from cdm_auto_sync import (
     DEFAULT_INITIAL_LOOKBACK_DAYS,
     DEFAULT_INTERVAL_HOURS,
@@ -22,6 +24,9 @@ from cdm_auto_sync import (
     DEFAULT_OVERLAP_HOURS,
     run_sync_once,
 )
+
+# Use the Space-Track cdm_public CREATED schema and preserve provider payloads.
+cdm_auto_sync.fetch_available_cdms = fetch_available_cdms
 
 LOGGER = logging.getLogger("orbitways.cdm_sync_daemon")
 
