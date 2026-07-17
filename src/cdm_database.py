@@ -45,8 +45,6 @@ def init_cdm_db():
             CREATE INDEX IF NOT EXISTS idx_cdm_target ON cdm_records(target_norad);
             CREATE INDEX IF NOT EXISTS idx_cdm_tca ON cdm_records(tca);
             CREATE INDEX IF NOT EXISTS idx_cdm_creation ON cdm_records(creation_date);
-            CREATE INDEX IF NOT EXISTS idx_cdm_secondary ON cdm_records(secondary_norad);
-            CREATE INDEX IF NOT EXISTS idx_cdm_object_class ON cdm_records(object_class);
             """
         )
         conn.commit()
@@ -97,8 +95,9 @@ def _normalize_norad(value) -> Optional[str]:
 def _parse_dt(value) -> Optional[str]:
     if value in (None, ""):
         return None
-    value = str(value).strip()
-    for candidate in (value, value.replace("Z", "+00:00")):
+    raw = str(value).strip()
+    candidates = (raw, raw.replace("Z", "+00:00"))
+    for candidate in candidates:
         try:
             dt = datetime.fromisoformat(candidate)
             if dt.tzinfo is None:
@@ -106,30 +105,30 @@ def _parse_dt(value) -> Optional[str]:
             return dt.astimezone(timezone.utc).isoformat()
         except Exception:
             continue
-    return value or None
+    return None
 
 
-def _parse_iso(value: str) -> datetime:
-    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+def _parse_iso(value) -> Optional[datetime]:
+    normalized = _parse_dt(value)
+    if not normalized:
+        return None
+    return datetime.fromisoformat(normalized)
 
 
 def _distance_km(row: dict[str, Any]) -> Optional[float]:
-    value = _as_float(_coalesce(row, "miss_distance_km", "MISS_DISTANCE_KM", "MISS_DISTANCE", "MINIMUM_RANGE", "MINIMUM_DISTANCE", "MISS_DISTANCE_VALUE"))
+    value = _as_float(_coalesce(row, "miss_distance_km", "MISS_DISTANCE_KM", "MISS_DISTANCE", "MIN_RNG", "MINIMUM_RANGE"))
     if value is None:
         return None
-    unit = str(_coalesce(row, "miss_distance_unit", "MISS_DISTANCE_UNIT", "DISTANCE_UNIT") or "km").lower()
+    unit = str(_coalesce(row, "MISS_DISTANCE_UNIT", "DISTANCE_UNIT") or "km").lower()
     return value / 1000.0 if unit in {"m", "meter", "meters", "metre", "metres"} else value
 
 
 def _speed_km_s(row: dict[str, Any]) -> Optional[float]:
-    value = _as_float(_coalesce(row, "relative_speed_km_s", "RELATIVE_SPEED_KM_S", "RELATIVE_SPEED", "RELATIVE_VELOCITY", "RELATIVE_VELOCITY_KM_S"))
+    value = _as_float(_coalesce(row, "relative_speed_km_s", "RELATIVE_SPEED_KM_S", "RELATIVE_SPEED", "RELATIVE_VELOCITY"))
     if value is None:
         return None
-    unit = str(_coalesce(row, "relative_speed_unit", "RELATIVE_SPEED_UNIT", "RELATIVE_VELOCITY_UNIT") or "km/s").lower()
-    return value / 1000.0 if unit in {"m/s", "mps", "meter/s", "meters/s"} else value
+    unit = str(_coalesce(row, "RELATIVE_SPEED_UNIT", "RELATIVE_VELOCITY_UNIT") or "km/s").lower()
+    return value / 1000.0 if unit in {"m/s", "mps"} else value
 
 
 def _lookup_metadata(conn, norad: Optional[str]) -> Optional[dict[str, Any]]:
@@ -140,45 +139,24 @@ def _lookup_metadata(conn, norad: Optional[str]) -> Optional[dict[str, Any]]:
             "SELECT norad_id, object_name, object_type, decay_date, ops_status_code FROM object_metadata WHERE norad_id=?",
             (str(norad),),
         ).fetchone()
+        return dict(row) if row else None
     except Exception:
         return None
-    return dict(row) if row else None
 
 
-def classify_secondary(row: dict[str, Any], metadata: Optional[dict[str, Any]] = None) -> tuple[str, str, Optional[str]]:
-    explicit = _clean(_coalesce(row, "object_class", "secondary_object_class", "OBJECT_CLASS"))
-    if explicit:
-        normalized = explicit.lower().replace(" ", "_").replace("-", "_")
-        if normalized in OBJECT_CLASSES:
-            return normalized, "input_object_class", _clean(_coalesce(row, "object_type", "OBJECT_TYPE"))
-        if "debris" in normalized:
-            return "debris", "input_object_class", explicit
-        if "rocket" in normalized or "inactive" in normalized:
-            return "inactive_satellite", "input_object_class", explicit
-        if "active" in normalized or "payload" in normalized:
-            return "active_satellite", "input_object_class", explicit
-
+def classify_secondary(row: dict[str, Any], metadata: Optional[dict[str, Any]] = None):
     object_type = _clean(_coalesce(row, "object_type", "OBJECT_TYPE", "secondary_object_type", "SECONDARY_OBJECT_TYPE"))
-    decay_date = _clean(_coalesce(row, "decay_date", "DECAY_DATE"))
-    ops_status = _clean(_coalesce(row, "ops_status_code", "OPS_STATUS_CODE"))
     if metadata:
         object_type = object_type or _clean(metadata.get("object_type"))
-        decay_date = decay_date or _clean(metadata.get("decay_date"))
-        ops_status = ops_status or _clean(metadata.get("ops_status_code"))
-
-    ot = (object_type or "").upper()
-    os = (ops_status or "").upper()
-    if "DEBRIS" in ot:
+    value = (object_type or "").upper()
+    if "DEBRIS" in value:
         return "debris", "object_type", object_type
-    if "ROCKET" in ot or "R/B" in ot:
+    if "ROCKET" in value or "R/B" in value:
         return "inactive_satellite", "object_type", object_type
-    if "PAYLOAD" in ot:
-        if decay_date or os in INACTIVE_OPS_STATUS:
-            return "inactive_satellite", "payload_status", object_type
-        return "active_satellite", "payload_status", object_type
-
-    name = str(_coalesce(row, "secondary_name", "SECONDARY_NAME", "OBJECT_NAME", "SAT_2_NAME") or "").upper()
-    if "DEB" in name or "DEBRIS" in name:
+    if "PAYLOAD" in value:
+        return "active_satellite", "object_type", object_type
+    name = str(_coalesce(row, "secondary_name", "SECONDARY_NAME", "OBJECT_NAME") or "").upper()
+    if "DEB" in name:
         return "debris", "name_heuristic", object_type
     if "R/B" in name or "ROCKET" in name:
         return "inactive_satellite", "name_heuristic", object_type
@@ -195,27 +173,26 @@ def _stable_cdm_id(row: dict[str, Any], normalized: dict[str, Any]) -> str:
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:32]
 
 
-def normalize_cdm_record(row: dict[str, Any], source: str, conn) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    target_norad = _normalize_norad(_coalesce(row, "target_norad", "TARGET_NORAD", "SAT_1_ID", "SAT1_ID", "OBJECT1_NORAD", "OBJECT_1_NORAD", "PRIMARY_NORAD", "TARGET_NORAD_CAT_ID"))
-    secondary_norad = _normalize_norad(_coalesce(row, "secondary_norad", "SECONDARY_NORAD", "SAT_2_ID", "SAT2_ID", "OBJECT2_NORAD", "OBJECT_2_NORAD", "SECONDARY_NORAD_CAT_ID"))
-    creation_date = _parse_dt(_coalesce(row, "creation_date", "CREATION_DATE", "MESSAGE_CREATION_DATE", "CDM_CREATION_DATE", "CREATED"))
+def normalize_cdm_record(row: dict[str, Any], source: str, conn):
+    target_norad = _normalize_norad(_coalesce(row, "target_norad", "TARGET_NORAD", "SAT_1_ID", "SAT1_ID", "PRIMARY_NORAD"))
+    secondary_norad = _normalize_norad(_coalesce(row, "secondary_norad", "SECONDARY_NORAD", "SAT_2_ID", "SAT2_ID"))
+    creation_date = _parse_dt(_coalesce(row, "creation_date", "CREATION_DATE", "CREATED", "MESSAGE_CREATION_DATE"))
     tca = _parse_dt(_coalesce(row, "tca", "TCA", "TIME_OF_CLOSEST_APPROACH"))
     if not target_norad:
         return None, "missing target NORAD"
     if not tca:
         return None, "missing TCA"
-
     metadata = _lookup_metadata(conn, secondary_norad)
     object_class, object_class_source, object_type = classify_secondary(row, metadata)
     normalized = {
         "target_norad": target_norad,
-        "target_name": _clean(_coalesce(row, "target_name", "TARGET_NAME", "SAT_1_NAME", "OBJECT1_NAME", "PRIMARY_NAME")),
+        "target_name": _clean(_coalesce(row, "target_name", "TARGET_NAME", "SAT_1_NAME")),
         "secondary_norad": secondary_norad,
-        "secondary_name": _clean(_coalesce(row, "secondary_name", "SECONDARY_NAME", "SAT_2_NAME", "OBJECT2_NAME", "OBJECT_NAME")) or (metadata or {}).get("object_name"),
+        "secondary_name": _clean(_coalesce(row, "secondary_name", "SECONDARY_NAME", "SAT_2_NAME")) or (metadata or {}).get("object_name"),
         "creation_date": creation_date,
         "tca": tca,
         "miss_distance_km": _distance_km(row),
-        "pc": _as_float(_coalesce(row, "pc", "Pc", "PC", "COLLISION_PROBABILITY", "PROBABILITY_OF_COLLISION")),
+        "pc": _as_float(_coalesce(row, "pc", "PC", "COLLISION_PROBABILITY")),
         "relative_speed_km_s": _speed_km_s(row),
         "object_type": object_type,
         "object_class": object_class,
@@ -238,7 +215,7 @@ def ingest_cdm_records(records: list[dict[str, Any]], source: str = "manual") ->
     conn = get_connection()
     imported_at = datetime.now(timezone.utc).isoformat()
     upserted = skipped = errors = 0
-    error_samples: list[str] = []
+    error_samples = []
     try:
         for row in records or []:
             normalized, error = normalize_cdm_record(row, source, conn)
@@ -250,25 +227,11 @@ def ingest_cdm_records(records: list[dict[str, Any]], source: str = "manual") ->
             try:
                 conn.execute(
                     """INSERT INTO cdm_records
-                       (cdm_id,target_norad,target_name,secondary_norad,secondary_name,creation_date,tca,
-                        miss_distance_km,pc,relative_speed_km_s,object_type,object_class,object_class_source,
-                        source,raw_json,imported_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(cdm_id) DO UPDATE SET
-                        target_norad=excluded.target_norad,target_name=excluded.target_name,
-                        secondary_norad=excluded.secondary_norad,secondary_name=excluded.secondary_name,
-                        creation_date=excluded.creation_date,tca=excluded.tca,
-                        miss_distance_km=excluded.miss_distance_km,pc=excluded.pc,
-                        relative_speed_km_s=excluded.relative_speed_km_s,object_type=excluded.object_type,
-                        object_class=excluded.object_class,object_class_source=excluded.object_class_source,
-                        source=excluded.source,raw_json=excluded.raw_json,imported_at=excluded.imported_at""",
-                    (
-                        normalized["cdm_id"], normalized["target_norad"], normalized["target_name"],
-                        normalized["secondary_norad"], normalized["secondary_name"], normalized["creation_date"],
-                        normalized["tca"], normalized["miss_distance_km"], normalized["pc"],
-                        normalized["relative_speed_km_s"], normalized["object_type"], normalized["object_class"],
-                        normalized["object_class_source"], normalized["source"], normalized["raw_json"], imported_at,
-                    ),
+                    (cdm_id,target_norad,target_name,secondary_norad,secondary_name,creation_date,tca,miss_distance_km,pc,relative_speed_km_s,object_type,object_class,object_class_source,source,raw_json,imported_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(cdm_id) DO UPDATE SET
+                    target_norad=excluded.target_norad,target_name=excluded.target_name,secondary_norad=excluded.secondary_norad,secondary_name=excluded.secondary_name,creation_date=excluded.creation_date,tca=excluded.tca,miss_distance_km=excluded.miss_distance_km,pc=excluded.pc,relative_speed_km_s=excluded.relative_speed_km_s,object_type=excluded.object_type,object_class=excluded.object_class,object_class_source=excluded.object_class_source,source=excluded.source,raw_json=excluded.raw_json,imported_at=excluded.imported_at""",
+                    tuple(normalized[k] for k in ("cdm_id","target_norad","target_name","secondary_norad","secondary_name","creation_date","tca","miss_distance_km","pc","relative_speed_km_s","object_type","object_class","object_class_source","source","raw_json")) + (imported_at,),
                 )
                 upserted += 1
             except Exception as exc:
@@ -287,10 +250,8 @@ def cdm_status() -> dict[str, Any]:
     try:
         total = conn.execute("SELECT COUNT(*) FROM cdm_records").fetchone()[0]
         targets = conn.execute("SELECT COUNT(DISTINCT target_norad) FROM cdm_records").fetchone()[0]
-        sources = [dict(r) for r in conn.execute("SELECT source,COUNT(*) AS count FROM cdm_records GROUP BY source ORDER BY count DESC").fetchall()]
-        classes = [dict(r) for r in conn.execute("SELECT object_class,COUNT(*) AS count FROM cdm_records GROUP BY object_class ORDER BY count DESC").fetchall()]
         bounds = conn.execute("SELECT MIN(tca),MAX(tca),MIN(creation_date),MAX(creation_date) FROM cdm_records").fetchone()
-        return {"ok": True, "total_cdm_records": total, "unique_targets": targets, "sources": sources, "object_classes": classes, "tca_min": bounds[0], "tca_max": bounds[1], "creation_date_min": bounds[2], "creation_date_max": bounds[3]}
+        return {"ok": True, "total_cdm_records": total, "unique_targets": targets, "tca_min": bounds[0], "tca_max": bounds[1], "creation_date_min": bounds[2], "creation_date_max": bounds[3]}
     finally:
         conn.close()
 
@@ -309,46 +270,33 @@ def _classify_event(pc, miss_km, cdm_pc_threshold, cdm_miss_distance_threshold_k
     return "cdm"
 
 
-def run_historical_cdm_analysis(
-    target_norad: str,
-    lookback_days: float = 365,
-    bucket_days: float = 30,
-    time_axis: str = "creation_date",
-    cdm_pc_threshold: float = 1e-7,
-    cdm_miss_distance_threshold_km: float = 5,
-    maneuver_pc_threshold: float = 1e-4,
-    maneuver_miss_distance_threshold_km: float = 1,
-    max_events: int = 200,
-) -> dict[str, Any]:
-    """Analyze CDM messages issued inside the observation window.
+def run_historical_cdm_analysis(target_norad: str, lookback_days: float = 365, bucket_days: float = 30, time_axis: str = "creation_date", cdm_pc_threshold: float = 1e-7, cdm_miss_distance_threshold_km: float = 5, maneuver_pc_threshold: float = 1e-4, maneuver_miss_distance_threshold_km: float = 1, max_events: int = 200) -> dict[str, Any]:
+    """Analyze actual CDM messages by creation time.
 
-    creation_date is preferred. imported_at is used as a fallback for legacy rows
-    that were ingested before creation-date normalization was fixed.
+    All target rows are loaded first, then dates are parsed and filtered in Python.
+    This avoids SQLite string-comparison failures caused by mixed timestamp formats.
     """
     init_cdm_db()
     target_norad = _normalize_norad(target_norad)
-    axis = "creation_date"
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=float(lookback_days))
-
     conn = get_connection()
     try:
-        rows = [dict(row) for row in conn.execute(
-            """SELECT *, COALESCE(creation_date, imported_at) AS analysis_date
-               FROM cdm_records
-               WHERE target_norad=?
-                 AND COALESCE(creation_date, imported_at) >= ?
-                 AND COALESCE(creation_date, imported_at) <= ?
-               ORDER BY COALESCE(creation_date, imported_at) ASC""",
-            (target_norad, start.isoformat(), now.isoformat()),
-        ).fetchall()]
-        target_total = conn.execute("SELECT COUNT(*) FROM cdm_records WHERE target_norad=?", (target_norad,)).fetchone()[0]
-        bounds = conn.execute(
-            "SELECT MIN(COALESCE(creation_date, imported_at)), MAX(COALESCE(creation_date, imported_at)) FROM cdm_records WHERE target_norad=?",
-            (target_norad,),
-        ).fetchone()
+        all_target_rows = [dict(row) for row in conn.execute("SELECT * FROM cdm_records WHERE target_norad=?", (target_norad,)).fetchall()]
     finally:
         conn.close()
+
+    rows = []
+    rejected_dates = []
+    for row in all_target_rows:
+        analysis_date = _parse_iso(row.get("creation_date")) or _parse_iso(row.get("imported_at"))
+        if analysis_date is None:
+            rejected_dates.append({"cdm_id": row.get("cdm_id"), "creation_date": row.get("creation_date"), "imported_at": row.get("imported_at")})
+            continue
+        row["analysis_date"] = analysis_date.isoformat()
+        if start <= analysis_date <= now:
+            rows.append(row)
+    rows.sort(key=lambda row: row["analysis_date"])
 
     buckets = []
     all_events = []
@@ -357,15 +305,7 @@ def run_historical_cdm_analysis(
     while cursor < now:
         b0 = cursor
         b1 = min(cursor + timedelta(days=float(bucket_days)), now)
-        bucket_rows = []
-        for row in rows:
-            try:
-                dt = _parse_iso(row.get("analysis_date"))
-            except Exception:
-                continue
-            if b0 <= dt < b1 or (b1 == now and dt == b1):
-                bucket_rows.append(row)
-
+        bucket_rows = [row for row in rows if b0 <= _parse_iso(row["analysis_date"]) < b1 or (b1 == now and _parse_iso(row["analysis_date"]) == b1)]
         by_class = _empty_by_class()
         high_interest = maneuvers = 0
         for row in bucket_rows:
@@ -379,65 +319,34 @@ def run_historical_cdm_analysis(
             if level == "maneuver":
                 by_class[cls]["maneuver"] += 1
                 maneuvers += 1
-            all_events.append({
-                "cdm_id": row.get("cdm_id"), "target_norad": row.get("target_norad"),
-                "secondary_norad": row.get("secondary_norad"), "secondary_name": row.get("secondary_name"),
-                "object_class": cls, "object_class_source": row.get("object_class_source"),
-                "object_type": row.get("object_type"), "creation_date": row.get("creation_date"),
-                "analysis_date": row.get("analysis_date"), "tca": row.get("tca"),
-                "miss_distance_km": row.get("miss_distance_km"), "pc": row.get("pc"),
-                "pc_str": f"{float(row['pc']):.2e}" if row.get("pc") is not None else None,
-                "relative_speed_km_s": row.get("relative_speed_km_s"), "decision_level": level,
-                "source": row.get("source"),
-            })
-
+            all_events.append({"cdm_id": row.get("cdm_id"), "target_norad": row.get("target_norad"), "secondary_norad": row.get("secondary_norad"), "secondary_name": row.get("secondary_name"), "creation_date": row.get("creation_date"), "analysis_date": row.get("analysis_date"), "tca": row.get("tca"), "miss_distance_km": row.get("miss_distance_km"), "pc": row.get("pc"), "decision_level": level, "object_class": cls})
         count = len(bucket_rows)
         total_cdm += count
         total_hi += high_interest
         total_man += maneuvers
-        buckets.append({
-            "bucket_start": b0.isoformat(), "bucket_end": b1.isoformat(),
-            "cdm_records": count, "high_interest_cdms": high_interest,
-            "maneuver_candidates": maneuvers, "by_object_class": by_class,
-            "max_pc": max((float(r["pc"]) for r in bucket_rows if r.get("pc") is not None), default=0.0),
-            "min_miss_distance_km": min((float(r["miss_distance_km"]) for r in bucket_rows if r.get("miss_distance_km") is not None), default=None),
-        })
+        buckets.append({"bucket_start": b0.isoformat(), "bucket_end": b1.isoformat(), "cdm_records": count, "high_interest_cdms": high_interest, "maneuver_candidates": maneuvers, "by_object_class": by_class})
         cursor = b1
 
-    all_events.sort(key=lambda e: (-(float(e.get("pc") or 0.0)), float(e.get("miss_distance_km") if e.get("miss_distance_km") is not None else 1e9)))
-    effective_days = max(0.0, (now - start).total_seconds() / 86400)
-    annual = lambda n: None if effective_days <= 0 else round(float(n) * 365.25 / effective_days, 2)
+    effective_days = max((now - start).total_seconds() / 86400, 0.0)
+    annual = lambda count: None if effective_days <= 0 else round(float(count) * 365.25 / effective_days, 2)
     return {
-        "ok": True, "mode": "historical_cdm_analysis", "target_norad": target_norad,
-        "time_axis": axis, "requested_time_axis": time_axis,
-        "lookback_days": lookback_days, "bucket_days": bucket_days,
-        "window_start": start.isoformat(), "window_end": now.isoformat(),
-        "database_target_records": target_total,
-        "database_analysis_date_min": bounds[0] if bounds else None,
-        "database_analysis_date_max": bounds[1] if bounds else None,
+        "ok": True,
+        "mode": "historical_cdm_analysis",
+        "target_norad": target_norad,
+        "time_axis": "creation_date",
+        "requested_time_axis": time_axis,
+        "lookback_days": lookback_days,
+        "bucket_days": bucket_days,
+        "window_start": start.isoformat(),
+        "window_end": now.isoformat(),
+        "database_target_records": len(all_target_rows),
         "matched_records": len(rows),
-        "thresholds": {
-            "cdm_pc_threshold": cdm_pc_threshold, "cdm_pc_threshold_str": f"{cdm_pc_threshold:.2e}",
-            "cdm_miss_distance_threshold_km": cdm_miss_distance_threshold_km,
-            "maneuver_pc_threshold": maneuver_pc_threshold, "maneuver_pc_threshold_str": f"{maneuver_pc_threshold:.2e}",
-            "maneuver_miss_distance_threshold_km": maneuver_miss_distance_threshold_km,
-        },
-        "summary": {
-            "cdm_records": total_cdm, "high_interest_cdms": total_hi,
-            "maneuver_candidates": total_man, "annualized_cdm_records": annual(total_cdm),
-            "annualized_high_interest_cdms": annual(total_hi), "annualized_maneuver_candidates": annual(total_man),
-        },
-        "time_series": buckets, "top_events": all_events[: int(max_events)],
-        "methodology": {
-            "source": "imported CDM records", "time_axis": axis,
-            "cdm_count_definition": "one imported CDM message inside the observation window",
-            "high_interest_definition": "CDM message with Pc above threshold or miss distance below threshold",
-            "maneuver_candidate_definition": "CDM message with maneuver threshold crossed",
-        },
-        "limitations": [
-            "Public Space-Track CDM coverage can be incomplete.",
-            "Legacy rows without creation_date are matched using imported_at.",
-            "Repeated CDM updates for the same physical conjunction are currently counted separately.",
-            "A maneuver candidate is not evidence that a maneuver was executed.",
-        ],
+        "rejected_date_records": rejected_dates[:10],
+        "stored_date_samples": [{"cdm_id": row.get("cdm_id"), "creation_date": row.get("creation_date"), "imported_at": row.get("imported_at")} for row in all_target_rows[:10]],
+        "thresholds": {"cdm_pc_threshold": cdm_pc_threshold, "cdm_miss_distance_threshold_km": cdm_miss_distance_threshold_km, "maneuver_pc_threshold": maneuver_pc_threshold, "maneuver_miss_distance_threshold_km": maneuver_miss_distance_threshold_km},
+        "summary": {"cdm_records": total_cdm, "high_interest_cdms": total_hi, "maneuver_candidates": total_man, "annualized_cdm_records": annual(total_cdm), "annualized_high_interest_cdms": annual(total_hi), "annualized_maneuver_candidates": annual(total_man)},
+        "time_series": buckets,
+        "top_events": all_events[: int(max_events)],
+        "methodology": {"source": "imported CDM records", "time_axis": "creation_date"},
+        "limitations": ["Repeated CDM updates may describe the same physical conjunction."]
     }
