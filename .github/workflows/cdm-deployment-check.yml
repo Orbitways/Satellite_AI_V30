@@ -1,0 +1,59 @@
+name: CDM deployment check
+
+on:
+  pull_request:
+    paths:
+      - "api/**"
+      - "src/**"
+      - "scripts/**"
+      - "deploy/**"
+      - "tests/test_cdm_auto_sync.py"
+      - "tests/test_cdm_archive_provider.py"
+      - ".github/workflows/cdm-deployment-check.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "api/**"
+      - "src/**"
+      - "scripts/**"
+      - "deploy/**"
+      - "tests/test_cdm_auto_sync.py"
+      - "tests/test_cdm_archive_provider.py"
+      - ".github/workflows/cdm-deployment-check.yml"
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r deploy/requirements-backend.txt pytest
+
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+        run: |
+          pytest -q tests/test_cdm_auto_sync.py tests/test_cdm_archive_provider.py
+
+      - name: Validate Python entry points
+        run: |
+          python -m py_compile \
+            src/cdm_auto_sync.py \
+            src/cdm_archive_provider.py \
+            src/cdm_archive_cli.py \
+            src/cdm_sync_daemon.py \
+            deploy/backup_sqlite.py
+
+      - name: Build production image
+        run: docker build -f deploy/Dockerfile .
