@@ -42,7 +42,7 @@ export CDM_SYNC_MAX_RECORDS=50000
 From the repository root:
 
 ```bash
-./scripts/start_backend_with_cdm_sync.sh
+bash scripts/start_backend_with_cdm_sync.sh
 ```
 
 The default API command is equivalent to:
@@ -58,13 +58,13 @@ Override `HOST`, `PORT`, or `UVICORN_APP` when required.
 Run one synchronization immediately:
 
 ```bash
-PYTHONPATH=src python -m cdm_auto_sync --once --force
+bash scripts/run_cdm_auto_sync.sh --once --force
 ```
 
 Show the durable scheduler history and CDM database status:
 
 ```bash
-PYTHONPATH=src python -m cdm_auto_sync --status
+bash scripts/run_cdm_auto_sync.sh --status
 ```
 
 ## Important deployment limitation
@@ -72,5 +72,5 @@ PYTHONPATH=src python -m cdm_auto_sync --status
 The worker only runs while the backend host is awake. A GitHub Codespace that
 is stopped or suspended cannot execute an 8-hour job. The worker catches up on
 restart within Space-Track's available lookback window, but uninterrupted
-collection requires an always-on host or an external scheduler running
-`python -m cdm_auto_sync --once` against a persistent database volume.
+collection requires an always-on host or an external scheduler running the
+one-shot worker against a persistent database volume.
