@@ -9,7 +9,7 @@ export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 : "${PORT:=8001}"
 : "${UVICORN_APP:=api.main:app}"
 
-python -m cdm_auto_sync &
+python -m cdm_sync_daemon &
 SYNC_PID=$!
 
 uvicorn "$UVICORN_APP" --host "$HOST" --port "$PORT" &
