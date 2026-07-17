@@ -1,0 +1,14 @@
+.git
+.github
+.env
+deploy/.env
+deploy/persistent
+data/*.sqlite
+data/*.sqlite-*
+data/spacetrack_cache
+backups
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv
