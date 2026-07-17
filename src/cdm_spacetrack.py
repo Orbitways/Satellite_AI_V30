@@ -1,7 +1,12 @@
 """Space-Track public CDM synchronization helpers.
 
+A historical ingestion lookback describes when CDM messages were created, not
+when the predicted conjunction reaches TCA. A CDM created today can refer to a
+TCA several days in the future, so filtering the upstream feed by TCA would
+silently exclude valid messages from the requested historical period.
+
 The public CDM schema is not guaranteed to expose queryable NORAD fields, and
-its returned column names can vary. Fetch a bounded TCA window, inspect the
+its returned column names can vary. Fetch a bounded CREATED window, inspect the
 actual payload, then filter and normalize locally. Never report a successful
 import when no record for the requested target was found.
 """
@@ -116,8 +121,6 @@ def normalize_spacetrack_cdm(row: dict[str, Any], target_norad: str) -> dict[str
     target = _norad(target_norad)
     n1, n2 = _pair_ids(row)
     if target not in {n1, n2}:
-        # Some public payloads use undocumented ID column names. Keep only rows
-        # where the requested NORAD is present, then assign the other detected ID.
         candidates = _candidate_ids(row)
         if target not in candidates:
             return None
@@ -151,9 +154,9 @@ def normalize_spacetrack_cdm(row: dict[str, Any], target_norad: str) -> dict[str
     }
 
 
-def _query_path(start: str, end: str, max_records: int) -> str:
+def _query_path(start: str, end_exclusive: str, max_records: int) -> str:
     limit = f"/limit/{int(max_records)}" if max_records else ""
-    return f"/class/cdm_public/TCA/{start}--{end}/orderby/TCA%20asc/format/json{limit}"
+    return f"/class/cdm_public/CREATED/{start}--{end_exclusive}/orderby/CREATED%20asc/format/json{limit}"
 
 
 def fetch_spacetrack_public_cdms(target_norad: str, lookback_days: int = 365, max_records: int = 10000) -> dict[str, Any]:
@@ -167,9 +170,11 @@ def fetch_spacetrack_public_cdms(target_norad: str, lookback_days: int = 365, ma
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=int(lookback_days))
     start = start_dt.strftime("%Y-%m-%d")
-    end = end_dt.strftime("%Y-%m-%d")
+    # Space-Track date-only range boundaries can omit records created later on
+    # the end date. Query through tomorrow, while reporting the true UTC window.
+    query_end_exclusive = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
     base = "https://www.space-track.org/basicspacedata/query"
-    path = _query_path(start, end, max_records)
+    path = _query_path(start, query_end_exclusive, max_records)
 
     with SpaceTrackSession() as client:
         raw_text = _decode(client._request(base + path))
@@ -209,6 +214,7 @@ def fetch_spacetrack_public_cdms(target_norad: str, lookback_days: int = 365, ma
         "status": status,
         "target_norad": target,
         "lookback_days": lookback_days,
+        "window_axis": "creation_date",
         "window_start": start_dt.isoformat(),
         "window_end": end_dt.isoformat(),
         "raw_rows_fetched": len(raw_rows),
@@ -218,8 +224,8 @@ def fetch_spacetrack_public_cdms(target_norad: str, lookback_days: int = 365, ma
         "query_errors": [],
         "sample_response_keys": sample_keys,
         "note": (
-            "No public CDM matched this NORAD in the requested window. This is a data-availability result, not a successful zero-event import."
+            "No public CDM created in the requested period matched this NORAD. This is a data-availability result, not a successful zero-event import."
             if not normalized
-            else "Imported actual Space-Track cdm_public records for the requested target. Public coverage may be incomplete."
+            else "Imported actual Space-Track cdm_public records created during the requested period for the requested target. Public coverage may be incomplete."
         ),
     }
