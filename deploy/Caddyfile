@@ -1,0 +1,16 @@
+{$API_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy orbitways-api:8001
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}
