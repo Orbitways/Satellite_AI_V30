@@ -1,0 +1,42 @@
+name: Build Space-Track CDM archive
+
+on:
+  schedule:
+    - cron: "17 */8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cdm-archive-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app
+      - uses: actions/checkout@v4
+        with:
+          ref: cdm-archive
+          path: archive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Space-Track client
+        working-directory: app
+        run: python -m pip install spacetrack
+      - name: Sync and persist archive
+        working-directory: app
+        env:
+          SPACETRACK_EMAIL: ${{ secrets.SPACETRACK_EMAIL }}
+          SPACETRACK_PASSWORD: ${{ secrets.SPACETRACK_PASSWORD }}
+          CDM_SYNC_INITIAL_LOOKBACK_DAYS: "30"
+          CDM_SYNC_MAX_LOOKBACK_DAYS: "30"
+          CDM_SYNC_MAX_RECORDS: "50000"
+          CDM_SYNC_OVERLAP_HOURS: "24"
+        run: bash scripts/github_cdm_archive_sync.sh "$GITHUB_WORKSPACE/archive"

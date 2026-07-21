@@ -107,8 +107,14 @@ def normalize_spacetrack_cdm(row: dict[str, Any], target_norad: str) -> dict[str
 
 
 def _query_paths(target: str, start: str, end: str, max_records: int) -> list[str]:
+    """Build public-CDM queries using message creation time, not TCA.
+
+    A CDM created inside the requested lookback commonly has a TCA after the
+    window end. Filtering on TCA therefore drops the newest alerts and made the
+    UI report zero records even though those messages had just been published.
+    """
     limit = f"/limit/{int(max_records)}" if max_records else ""
-    common = f"/TCA/{start}--{end}/orderby/TCA%20asc/format/json{limit}"
+    common = f"/CREATED/{start}--{end}/orderby/CREATED%20asc/format/json{limit}"
     return [
         f"/class/cdm_public/SAT_1_ID/{target}{common}",
         f"/class/cdm_public/SAT_2_ID/{target}{common}",
@@ -175,10 +181,11 @@ def fetch_spacetrack_public_cdms(target_norad: str, lookback_days: int = 365, ma
         "lookback_days": lookback_days,
         "window_start": start_dt.isoformat(),
         "window_end": end_dt.isoformat(),
+        "time_filter": "creation_date",
         "raw_rows_fetched": len(raw_rows),
         "records_for_target": len(normalized),
         "import_report": report,
         "attempted_queries": attempted,
         "query_errors": errors[:10],
-        "note": "Fetched from Space-Track cdm_public when available. Public CDMs may not include all operator-private CDM records.",
+        "note": "Fetched from Space-Track cdm_public by message creation date when available. Public CDMs may not include all operator-private CDM records.",
     }
