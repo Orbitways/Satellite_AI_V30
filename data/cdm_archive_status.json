@@ -4,19 +4,34 @@
   "credentials_configured": true,
   "state": {
     "provider": "spacetrack_cdm_public",
-    "last_started_at": "2026-07-23T10:36:12.513233+00:00",
-    "last_success_at": "2026-07-23T10:36:17.305918+00:00",
-    "last_window_start": "2026-07-22T03:49:09.739700+00:00",
-    "last_window_end": "2026-07-23T10:36:12.513233+00:00",
-    "last_raw_rows": 129,
-    "last_upserted": 129,
+    "last_started_at": "2026-07-23T17:50:05.464324+00:00",
+    "last_success_at": "2026-07-23T17:50:10.041588+00:00",
+    "last_window_start": "2026-07-22T10:36:17.305918+00:00",
+    "last_window_end": "2026-07-23T17:50:05.464324+00:00",
+    "last_raw_rows": 135,
+    "last_upserted": 135,
     "last_error": null,
-    "next_due_at": "2026-07-23T18:36:17.305918+00:00",
+    "next_due_at": "2026-07-24T01:50:10.041588+00:00",
     "lease_owner": null,
     "lease_until": null,
-    "updated_at": "2026-07-23T10:36:17.305918+00:00"
+    "updated_at": "2026-07-23T17:50:10.041588+00:00"
   },
   "recent_runs": [
+    {
+      "id": 9,
+      "provider": "spacetrack_cdm_public",
+      "started_at": "2026-07-23T17:50:05.464324+00:00",
+      "finished_at": "2026-07-23T17:50:10.041588+00:00",
+      "status": "success",
+      "window_start": "2026-07-22T10:36:17.305918+00:00",
+      "window_end": "2026-07-23T17:50:05.464324+00:00",
+      "raw_rows": 135,
+      "upserted_rows": 135,
+      "skipped_rows": 0,
+      "error_rows": 0,
+      "error_text": null,
+      "worker_id": "runnervmvrwv9:2405:503af9ea"
+    },
     {
       "id": 8,
       "provider": "spacetrack_cdm_public",
@@ -140,31 +155,31 @@
   ],
   "cdm_database": {
     "ok": true,
-    "total_cdm_records": 2854,
-    "unique_targets": 787,
+    "total_cdm_records": 2879,
+    "unique_targets": 794,
     "sources": [
       {
         "source": "spacetrack_cdm_public",
-        "count": 2854
+        "count": 2879
       }
     ],
     "object_classes": [
       {
         "object_class": "debris",
-        "count": 1575
+        "count": 1587
       },
       {
         "object_class": "active_satellite",
-        "count": 892
+        "count": 899
       },
       {
         "object_class": "inactive_satellite",
-        "count": 387
+        "count": 393
       }
     ],
     "tca_min": "2026-06-21T11:35:06.781000+00:00",
-    "tca_max": "2026-07-26T00:07:49.610000+00:00",
+    "tca_max": "2026-07-26T06:05:58.377000+00:00",
     "creation_date_min": "2026-06-21T11:00:55+00:00",
-    "creation_date_max": "2026-07-23T05:15:33+00:00"
+    "creation_date_max": "2026-07-23T12:49:25+00:00"
   }
 }
