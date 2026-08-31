@@ -4,19 +4,34 @@
   "credentials_configured": true,
   "state": {
     "provider": "spacetrack_cdm_public",
-    "last_started_at": "2026-08-30T19:20:43.675320+00:00",
-    "last_success_at": "2026-08-30T19:20:48.362163+00:00",
-    "last_window_start": "2026-08-29T13:50:07.204207+00:00",
-    "last_window_end": "2026-08-30T19:20:43.675320+00:00",
-    "last_raw_rows": 105,
-    "last_upserted": 105,
+    "last_started_at": "2026-08-31T05:44:55.657382+00:00",
+    "last_success_at": "2026-08-31T05:45:00.237291+00:00",
+    "last_window_start": "2026-08-29T19:20:48.362163+00:00",
+    "last_window_end": "2026-08-31T05:44:55.657382+00:00",
+    "last_raw_rows": 140,
+    "last_upserted": 140,
     "last_error": null,
-    "next_due_at": "2026-08-31T03:20:48.362163+00:00",
+    "next_due_at": "2026-08-31T13:45:00.237291+00:00",
     "lease_owner": null,
     "lease_until": null,
-    "updated_at": "2026-08-30T19:20:48.362163+00:00"
+    "updated_at": "2026-08-31T05:45:00.237291+00:00"
   },
   "recent_runs": [
+    {
+      "id": 120,
+      "provider": "spacetrack_cdm_public",
+      "started_at": "2026-08-31T05:44:55.657382+00:00",
+      "finished_at": "2026-08-31T05:45:00.237291+00:00",
+      "status": "success",
+      "window_start": "2026-08-29T19:20:48.362163+00:00",
+      "window_end": "2026-08-31T05:44:55.657382+00:00",
+      "raw_rows": 140,
+      "upserted_rows": 140,
+      "skipped_rows": 0,
+      "error_rows": 0,
+      "error_text": null,
+      "worker_id": "runnervmgx7h7:2486:8375f38b"
+    },
     {
       "id": 119,
       "provider": "spacetrack_cdm_public",
@@ -151,50 +166,35 @@
       "error_rows": 0,
       "error_text": null,
       "worker_id": "runnervm76f27:2188:d8c1cf3f"
-    },
-    {
-      "id": 110,
-      "provider": "spacetrack_cdm_public",
-      "started_at": "2026-08-26T18:05:34.649166+00:00",
-      "finished_at": "2026-08-26T18:05:39.285288+00:00",
-      "status": "success",
-      "window_start": "2026-08-25T09:05:46.250740+00:00",
-      "window_end": "2026-08-26T18:05:34.649166+00:00",
-      "raw_rows": 210,
-      "upserted_rows": 210,
-      "skipped_rows": 0,
-      "error_rows": 0,
-      "error_text": null,
-      "worker_id": "runnervmgx7h7:2160:fbb01426"
     }
   ],
   "cdm_database": {
     "ok": true,
-    "total_cdm_records": 6878,
-    "unique_targets": 1692,
+    "total_cdm_records": 6913,
+    "unique_targets": 1702,
     "sources": [
       {
         "source": "spacetrack_cdm_public",
-        "count": 6878
+        "count": 6913
       }
     ],
     "object_classes": [
       {
         "object_class": "debris",
-        "count": 3807
+        "count": 3835
       },
       {
         "object_class": "active_satellite",
-        "count": 1974
+        "count": 1979
       },
       {
         "object_class": "inactive_satellite",
-        "count": 1097
+        "count": 1099
       }
     ],
     "tca_min": "2026-06-21T11:35:06.781000+00:00",
-    "tca_max": "2026-09-02T11:09:25.602000+00:00",
+    "tca_max": "2026-09-02T17:00:23.717000+00:00",
     "creation_date_min": "2026-06-21T11:00:55+00:00",
-    "creation_date_max": "2026-08-30T12:40:54+00:00"
+    "creation_date_max": "2026-08-31T00:00:43+00:00"
   }
 }
