@@ -4,19 +4,34 @@
   "credentials_configured": true,
   "state": {
     "provider": "spacetrack_cdm_public",
-    "last_started_at": "2026-10-02T14:46:51.721986+00:00",
-    "last_success_at": "2026-10-02T14:46:56.208225+00:00",
-    "last_window_start": "2026-10-01T05:49:28.584311+00:00",
-    "last_window_end": "2026-10-02T14:46:51.721986+00:00",
-    "last_raw_rows": 128,
-    "last_upserted": 128,
+    "last_started_at": "2026-10-02T20:47:57.165896+00:00",
+    "last_success_at": "2026-10-02T20:48:01.830835+00:00",
+    "last_window_start": "2026-10-01T14:46:56.208225+00:00",
+    "last_window_end": "2026-10-02T20:47:57.165896+00:00",
+    "last_raw_rows": 88,
+    "last_upserted": 88,
     "last_error": null,
-    "next_due_at": "2026-10-02T22:46:56.208225+00:00",
+    "next_due_at": "2026-10-03T04:48:01.830835+00:00",
     "lease_owner": null,
     "lease_until": null,
-    "updated_at": "2026-10-02T14:46:56.208225+00:00"
+    "updated_at": "2026-10-02T20:48:01.830835+00:00"
   },
   "recent_runs": [
+    {
+      "id": 216,
+      "provider": "spacetrack_cdm_public",
+      "started_at": "2026-10-02T20:47:57.165896+00:00",
+      "finished_at": "2026-10-02T20:48:01.830835+00:00",
+      "status": "success",
+      "window_start": "2026-10-01T14:46:56.208225+00:00",
+      "window_end": "2026-10-02T20:47:57.165896+00:00",
+      "raw_rows": 88,
+      "upserted_rows": 88,
+      "skipped_rows": 0,
+      "error_rows": 0,
+      "error_text": null,
+      "worker_id": "runnervm8df0l:2462:1f5d7dec"
+    },
     {
       "id": 215,
       "provider": "spacetrack_cdm_public",
@@ -151,21 +166,6 @@
       "error_rows": 0,
       "error_text": null,
       "worker_id": "runnervmtr4k5:2390:e098b7ad"
-    },
-    {
-      "id": 206,
-      "provider": "spacetrack_cdm_public",
-      "started_at": "2026-09-29T05:51:12.800347+00:00",
-      "finished_at": "2026-09-29T05:51:17.495379+00:00",
-      "status": "success",
-      "window_start": "2026-09-27T16:48:28.543388+00:00",
-      "window_end": "2026-09-29T05:51:12.800347+00:00",
-      "raw_rows": 150,
-      "upserted_rows": 150,
-      "skipped_rows": 0,
-      "error_rows": 0,
-      "error_text": null,
-      "worker_id": "runnervmtr4k5:2217:7c1e4331"
     }
   ],
   "cdm_database": {
